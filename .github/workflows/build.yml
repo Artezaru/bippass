@@ -1,0 +1,137 @@
+name: Build executables
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: bippass-linux
+          - os: windows-latest
+            asset_name: bippass-windows.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+          pip install pyinstaller
+
+      - name: Build executable (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --name bippass --windowed --onefile \
+            --add-data "bippass/resources:bippass/resources" \
+            --collect-all PyQt5 \
+            bippass/__main__.py
+
+      - name: Build executable (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --name bippass --windowed --onefile `
+            --add-data "bippass/resources;bippass/resources" `
+            --collect-all PyQt5 `
+            bippass/__main__.py
+
+      - name: Package artifact (Linux)
+        if: runner.os == 'Linux'
+        run: mv dist/bippass "dist/${{ matrix.asset_name }}"
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        run: Move-Item dist/bippass.exe "dist/${{ matrix.asset_name }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+      - name: Build .deb package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Strip the leading "v" from the tag (e.g. "v1.0.0" -> "1.0.0"),
+          # or fall back to "0.0.0" when not triggered by a tag (manual
+          # workflow_dispatch run) -- dpkg requires a Version field.
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            VERSION="0.0.0"
+          fi
+
+          PKGROOT="pkgroot"
+          mkdir -p "$PKGROOT/DEBIAN" \
+                   "$PKGROOT/usr/bin" \
+                   "$PKGROOT/usr/share/applications" \
+                   "$PKGROOT/usr/share/pixmaps"
+
+          cp "dist/${{ matrix.asset_name }}" "$PKGROOT/usr/bin/bippass"
+          chmod 755 "$PKGROOT/usr/bin/bippass"
+
+          # Bundled fallback icon, reused as the app's launcher icon.
+          cp bippass/resources/app.png "$PKGROOT/usr/share/pixmaps/bippass.png"
+
+          cat > "$PKGROOT/DEBIAN/control" <<EOF
+          Package: bippass
+          Version: $VERSION
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Artezaru <artezaru.github@proton.me>
+          Description: Local python password manager based on Artezaru/pyaescbc.
+          EOF
+
+          cat > "$PKGROOT/usr/share/applications/bippass.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=bippass
+          Comment=Local python password manager
+          Exec=/usr/bin/bippass
+          Icon=bippass
+          Terminal=false
+          Categories=Utility;Security;
+          EOF
+
+          dpkg-deb --build --root-owner-group "$PKGROOT" "dist/bippass_${VERSION}_amd64.deb"
+
+      - name: Upload .deb artifact (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bippass-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
