@@ -28,7 +28,7 @@ from ..core.credentials import Credentials
 from ..core.totp import generate_totp_code
 
 from .translate import translator
-from .generator_qt import GeneratorDialog
+from .generator_dialog import GeneratorDialog
 
 from PyQt5.QtWidgets import (
     QWidget,
@@ -89,7 +89,7 @@ def _looks_like_website(value: str) -> bool:
 
 def _icons_directory() -> str:
     """
-    Path to the package's bundled ``resources/icons`` directory.
+    Path to the package's bundled ``resources/item_icons`` directory.
 
     Returns
     -------
@@ -98,7 +98,7 @@ def _icons_directory() -> str:
         cannot be located.
     """
     try:
-        ref = resources.files("bippass").joinpath("resources/icons")
+        ref = resources.files("bippass").joinpath("resources/item_icons")
         with resources.as_file(ref) as path:
             return str(path)
     except (ModuleNotFoundError, FileNotFoundError, OSError):
@@ -111,7 +111,7 @@ def _resolve_icon_path(path: str) -> str:
 
     A path that already has a directory component is returned
     unchanged. A path that is only a filename (e.g. ``"github.png"``)
-    is looked up inside ``resources/icons`` instead of being treated
+    is looked up inside ``resources/item_icons`` instead of being treated
     as relative to the current working directory.
 
     Parameters
@@ -129,7 +129,7 @@ def _resolve_icon_path(path: str) -> str:
     if head:
         return path
     try:
-        ref = resources.files("bippass").joinpath("resources/icons", tail)
+        ref = resources.files("bippass").joinpath("resources/item_icons", tail)
         with resources.as_file(ref) as resolved:
             return str(resolved)
     except (ModuleNotFoundError, FileNotFoundError, OSError):
@@ -166,7 +166,7 @@ def _valid_icon_pixmap(path: str | None) -> QPixmap | None:
 def _default_icon_pixmap() -> QPixmap | None:
     """
     Load the package's bundled fallback icon
-    (``bippass/resources/icons/_default.png``).
+    (``bippass/resources/item_icons/_default.png``).
 
     Uses ``importlib.resources`` rather than a path computed from
     ``__file__``: it goes through the import system's own loader
@@ -184,7 +184,7 @@ def _default_icon_pixmap() -> QPixmap | None:
         network drive/share).
     """
     try:
-        ref = resources.files("bippass").joinpath("resources/icons/_default.png")
+        ref = resources.files("bippass").joinpath("resources/item_icons/_default.png")
         with resources.as_file(ref) as path:
             return _valid_icon_pixmap(str(path))
     except (ModuleNotFoundError, FileNotFoundError, OSError):
@@ -197,7 +197,7 @@ def _icon_pixmap_or_default(path: str | None) -> QPixmap | None:
     icon if ``path`` is empty or does not point to a readable image.
 
     A bare filename (no directory component) is first resolved
-    against the bundled ``resources/icons`` directory (see
+    against the bundled ``resources/item_icons`` directory (see
     :func:`_resolve_icon_path`).
 
     Returns
@@ -531,6 +531,37 @@ class FieldRow(QFrame):
         )
         return [raw]
 
+    def set_edit_values(self, values: list[str]) -> None:
+        """
+        Populate the EDIT-mode widget(s) directly with ``values``,
+        without touching :attr:`_clear_lines` (the VIEW-mode data).
+ 
+        Parameters
+        ----------
+        values : list of str
+            Same shape :meth:`get_edit_values` returns: one entry per
+            row for a list field, a single-element list otherwise.
+ 
+        Notes
+        -----
+        Used to restore in-progress, unsaved edits after the row is
+        rebuilt for an unrelated reason -- see
+        :meth:`ItemViewer._refresh_display_preserving_edits`, which
+        this is the counterpart of.
+        """
+        if self._use_list_edit:
+            self._clear_entries()
+            for value in values:
+                self._add_entry_row(value)
+        elif self._use_textarea_edit:
+            self.edit_text.blockSignals(True)
+            self.edit_text.setPlainText(values[0] if values else "")
+            self.edit_text.blockSignals(False)
+            self._auto_resize_edit_text()
+        else:
+            self.edit_line.setText(values[0] if values else "")
+            self._apply_edit_mask()
+
     def is_empty(self) -> bool:
         return len(self._clear_lines) == 0
 
@@ -788,7 +819,7 @@ class IconPreview(QLabel):
     Preview of the item's icon, shown at the top of the viewer.
 
     Falls back to the package's bundled default icon
-    (``resources/icons/_default.png``) when the item has no icon
+    (``resources/item_icons/_default.png``) when the item has no icon
     path, or the path is unreadable. When made editable (EDIT mode),
     a double click emits :attr:`edit_requested` instead of doing
     nothing.
@@ -837,7 +868,7 @@ class IconEditDialog(QDialog):
     """
     Small dialog to change an item's icon, by typing a path directly
     or browsing for a file (defaulting to the bundled
-    ``resources/icons`` directory).
+    ``resources/item_icons`` directory).
     """
 
     def __init__(self, current_path: str, parent=None):
@@ -877,7 +908,7 @@ class IconEditDialog(QDialog):
     def _shorten_if_bundled(filename: str) -> str:
         """
         Reduce ``filename`` to a bare filename (e.g. ``"github.png"``)
-        when it sits directly inside the bundled ``resources/icons``
+        when it sits directly inside the bundled ``resources/item_icons``
         directory -- the folder :meth:`_browse`'s dialog opens in by
         default -- so a selection made there is stored the same way
         as an icon referenced by name elsewhere (see
@@ -1318,6 +1349,42 @@ class ItemViewer(QWidget):
         self.cancel_btn.setVisible(self._edit_mode)
         self.save_btn.setVisible(self._edit_mode)
 
+    def _refresh_display_preserving_edits(self) -> None:
+        """
+        Like :meth:`_refresh_display`, but preserves whatever is
+        currently sitting -- typed but not yet saved -- in the item
+        name box and every field's EDIT-mode widgets, across the
+        rebuild.
+ 
+        Notes
+        -----
+        Adding or removing a custom field (see :meth:`_add_custom_field`/
+        :meth:`_remove_custom_field`) applies right away and is
+        followed by a full :meth:`_refresh_display`, which rebuilds
+        every row from the underlying :class:`Item` -- including the
+        standard fields and the name, whose in-progress edits would
+        otherwise be silently discarded even though the viewer stays
+        in EDIT mode the whole time. A no-op (falls back to a plain
+        :meth:`_refresh_display`) outside EDIT mode, where there is
+        nothing unsaved to preserve.
+        """
+        if not self._edit_mode:
+            self._refresh_display()
+            return
+ 
+        name_snapshot = self.title_edit.text()
+        field_snapshot = {
+            field: row.get_edit_values() for field, row in self._field_rows.items()
+        }
+ 
+        self._refresh_display()
+ 
+        self.title_edit.setText(name_snapshot)
+        for field, values in field_snapshot.items():
+            row = self._field_rows.get(field)
+            if row is not None:
+                row.set_edit_values(values)
+
     # -- VIEW / EDIT mode --------------------------------------------------
 
     def _enter_edit_mode(self) -> None:
@@ -1436,7 +1503,7 @@ class ItemViewer(QWidget):
             )
             return
 
-        self._refresh_display()
+        self._refresh_display_preserving_edits()
 
     def _remove_custom_field(self, field_key: str) -> None:
         name = (
@@ -1461,7 +1528,7 @@ class ItemViewer(QWidget):
             )
             return
 
-        self._refresh_display()
+        self._refresh_display_preserving_edits()
 
     # -- Closing -----------------------------------------------------------
 

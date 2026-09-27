@@ -48,7 +48,6 @@ from ..core.password_generator import (
 
 from .translate import translator, generator_translation
 
-
 def _t(key: str, **kwargs: str) -> str:
     """Shorthand for ``translator.translate(key, generator_translation, **kwargs)``."""
     return translator.translate(key, generator_translation, **kwargs)
@@ -157,7 +156,7 @@ class GeneratorDialog(QDialog):
 
         self.length_spin = QSpinBox()
         self.length_spin.setRange(1, 256)
-        self.length_spin.setValue(16)
+        self.length_spin.setValue(20)
         form.addRow(_t("length_label"), self.length_spin)
 
         self.lowercase_check = QCheckBox(_t("lowercase_label"))

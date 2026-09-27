@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import binascii
 import datetime
+import copy
 
 from enum import Enum, auto
 from typing import Literal, Sequence, cast, Tuple, TypeAlias
@@ -1197,3 +1198,38 @@ class Item:
         therefore not a copy. Modifying it directly modifies the item.
         """
         return self._data
+
+    def deepcopy(self) -> Item:
+        """
+        Return a deep copy of this item.
+ 
+        Returns
+        -------
+        Item
+            A new :class:`Item` instance with the same UUID and an
+            independent copy of the item's data: mutating the copy
+            (including its nested lists and the ``custom`` field
+            dictionary) never affects the original item, and vice
+            versa.
+ 
+        Notes
+        -----
+        This performs no encryption or decryption: encrypted fields
+        are copied exactly as stored (still Base64-encoded and
+        encrypted), so the copy still requires the same
+        :class:`Credentials` to read them.
+ 
+        The copy keeps the same UUID as the original. Callers that
+        need a distinct item (for example when duplicating an item
+        within a vault) are responsible for assigning a fresh UUID
+        to the returned copy, e.g. via
+        :meth:`PasswordManager.create_uuid`.
+ 
+        Examples
+        --------
+        >>> item_copy = item.deepcopy()
+        >>> item_copy.set("item_name", "Copy")
+        >>> item.get("item_name") != item_copy.get("item_name")
+        True
+        """
+        return Item(self._uuid, copy.deepcopy(self._data))

@@ -1138,13 +1138,19 @@ class PasswordManager:
             self.add_vault(vault)
             return vault
 
-    def remove_vault(self, name: str) -> None:
+    def remove_vault(self, name: str, force: bool = False) -> None:
         """Remove a vault.
 
         Parameters
         ----------
         name : str
             Name of the vault to remove.
+
+        force : bool, optional
+            If ``False`` (the default), removal is refused when the
+            vault still contains at least one item, so a vault full
+            of items can never be discarded by accident. Pass
+            ``True`` to remove the vault regardless of its contents.
 
         Raises
         ------
@@ -1153,11 +1159,25 @@ class PasswordManager:
 
         VaultNotFoundError
             If the specified vault does not exist.
+
+        ValueError
+            If the vault is not empty and ``force`` is ``False``.
+
+        Notes
+        -----
+        The items themselves are not individually removed first:
+        the whole (possibly non-empty) vault is simply dropped from
+        :attr:`_vaults` in one go once this method has decided to
+        proceed.
         """
         with self._lock:
             self._require_decrypted()
             if name not in self._vaults:
                 raise VaultNotFoundError(f"Unknown vault: {name!r}")
+            if not force and self._vaults[name].get_items():
+                raise ValueError(
+                    f"Vault {name!r} is not empty; pass force=True to remove it anyway."
+                )
             del self._vaults[name]
 
     def rename_vault(self, old_name: str, new_name: str) -> None:
@@ -1274,6 +1294,119 @@ class PasswordManager:
                 raise ItemAlreadyExistsError(f"Item UUID already exists: {item_uuid}")
 
             return target_vault.add_empty_item(item_uuid)
+
+    def add_item(self, item: Item, vault: str) -> Item:
+        """
+        Add an existing, possibly non-empty item to a vault.
+
+        Unlike :meth:`add_empty_item`, which always creates a fresh
+        empty item in place, this adds an already-populated
+        :class:`Item` -- typically built elsewhere, or produced by
+        :meth:`Item.deepcopy` -- to ``vault``.
+
+        Parameters
+        ----------
+        item : Item
+            Item to add.
+
+        vault : str
+            Name of the vault receiving the item.
+
+        Returns
+        -------
+        Item
+            The item actually added to ``vault``. This is ``item``
+            itself, unless its UUID collided with one already
+            registered anywhere in the manager, in which case a new
+            :class:`Item` -- carrying the same data but a freshly
+            generated UUID -- is added and returned instead (see
+            Notes).
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`decrypt_data` has not been called yet (reached
+            transitively through :meth:`get_vault`/:attr:`uuids`).
+
+        VaultNotFoundError
+            If the target vault does not exist.
+
+        Notes
+        -----
+        Item UUIDs must stay globally unique across the whole
+        manager (see :attr:`uuids`), so ``item``'s current UUID is
+        *never* kept if it already conflicts with an existing item,
+        in *any* vault, not just ``vault``: a brand-new UUID is
+        generated instead (:meth:`create_uuid`), and ``item`` is
+        re-wrapped around that new UUID -- its data (as returned by
+        :meth:`Item.to_dict`) is carried over unchanged, by
+        reference, only the UUID differs -- before being added.
+
+        The item is otherwise stored by reference: its data is not
+        copied. Pass :meth:`Item.deepcopy` explicitly for an
+        independent copy (see :meth:`duplicate_item`, which does
+        exactly that to duplicate an item already in the manager).
+        """
+        with self._lock:
+            target_vault = self.get_vault(vault)
+
+            item_uuid = item.uuid
+            if item_uuid in self.uuids:
+                item_uuid = self.create_uuid()
+                item = Item(item_uuid, item.to_dict())
+
+            target_vault._items[item_uuid] = item
+            return item
+
+    def duplicate_item(self, item_uuid: str, vault: str) -> Item:
+        """
+        Duplicate an existing item within a vault.
+
+        Parameters
+        ----------
+        item_uuid : str
+            UUID of the item to duplicate.
+
+        vault : str
+            Name of the vault containing the item; the duplicate is
+            added to this same vault.
+
+        Returns
+        -------
+        Item
+            The newly added duplicate. Its UUID is always different
+            from ``item_uuid`` (see Notes).
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`decrypt_data` has not been called yet (reached
+            transitively through :meth:`get_vault`).
+
+        VaultNotFoundError
+            If the specified vault does not exist.
+
+        ItemNotFoundError
+            If the specified item does not exist in that vault.
+
+        Notes
+        -----
+        Implemented as :meth:`Item.deepcopy` followed by
+        :meth:`add_item`. :meth:`Item.deepcopy` keeps the original
+        UUID on the copy, but that UUID necessarily collides with
+        the original item (still present in the manager), so
+        :meth:`add_item` always generates a fresh one for it: the
+        duplicate never ends up sharing a UUID with the item it was
+        copied from.
+
+        The duplicate's data is an independent deep copy: mutating
+        it afterwards never affects the original item, and vice
+        versa.
+        """
+        with self._lock:
+            original = self.get_vault(vault).get_item(item_uuid)
+            duplicate = original.deepcopy()
+            return self.add_item(duplicate, vault)
 
     def remove_item(self, item_uuid: str, vault: str) -> None:
         """Remove an item.
@@ -1399,6 +1532,203 @@ class PasswordManager:
             target._items[item_uuid] = item
 
     # ----------------
+    # Export / Import
+    # ----------------
+
+    def _export_items(
+        self,
+        path: str | Path,
+        items: list[str | tuple[str, str]],
+        export_credentials: Credentials,
+    ) -> None:
+        """
+        Export a selection of items to a brand-new, standalone vault file.
+
+        Builds a throwaway :class:`PasswordManager` holding a single
+        vault named ``"exported items"``, populates it with a
+        re-encrypted copy of every item in ``items``, and writes the
+        result to ``path`` -- an ordinary encrypted vault file,
+        readable back with a plain :class:`PasswordManager` (primary
+        password: ``export_credentials``) or with :meth:`_import_items`.
+
+        Parameters
+        ----------
+        path : str or Path
+            Destination file for the exported bundle. Created if it
+            does not exist, overwritten if it does.
+
+        items : list of (str or tuple of (str, str))
+            Items to export. Each entry is either:
+
+            - a bare item UUID (``str``), resolved by searching every
+              vault of this manager (see :meth:`get_item`), or
+            - a ``(item_uuid, vault)`` tuple, resolved directly in
+              that vault -- cheaper, and required if the same UUID
+              could otherwise be ambiguous.
+
+        export_credentials : Credentials
+            Primary and secondary password/iteration pairs the
+            exported file is encrypted with. Whoever receives the
+            file needs these same credentials to open it.
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`decrypt_data` has not been called yet (reached
+            transitively through :meth:`get_item`).
+
+        VaultNotFoundError
+            If an ``(item_uuid, vault)`` entry names a vault that
+            does not exist.
+
+        ItemNotFoundError
+            If an item UUID cannot be found.
+
+        OSError
+            If the encrypted bundle cannot be written to ``path``
+            (reached transitively through :meth:`save_changes`).
+
+        Notes
+        -----
+        For each requested item: :meth:`Item.deepcopy` first, so the
+        original item in *this* manager is never touched, then
+        :meth:`Item.change_credentials` on that copy, from this
+        manager's own secondary credentials to
+        ``export_credentials``' secondary credentials, so the
+        exported copy is decryptable with ``export_credentials``
+        alone. The re-encrypted copy is then handed to
+        :meth:`add_item`, which is also what assigns it its final
+        UUID (kept as-is unless it happens to collide, see
+        :meth:`add_item`).
+
+        The temporary manager is built with :meth:`PasswordManager.new`
+        (no on-disk file, nothing to decrypt) and is otherwise a
+        normal, fully functional manager: :meth:`save_changes` at the
+        end encrypts and writes it exactly as it would for any other
+        manager.
+        """
+        with self._lock:
+            self._require_decrypted()
+
+            temp_manager = PasswordManager.new({}, export_credentials)
+            temp_manager.add_empty_vault("exported items")
+
+            for entry in items:
+                if isinstance(entry, tuple):
+                    item_uuid, item_vault = entry
+                else:
+                    item_uuid, item_vault = entry, None
+
+                original = self.get_item(item_uuid, vault=item_vault)
+                duplicate = original.deepcopy()
+                duplicate.change_credentials(self._credentials, export_credentials)
+                temp_manager.add_item(duplicate, "exported items")
+
+            temp_manager.save_changes(path)
+
+    def _import_items(
+        self,
+        path: str | Path,
+        *,
+        vault: str = "imported items",
+        import_credentials: Credentials,
+    ) -> list[Item]:
+        """
+        Import items previously written by :meth:`_export_items`.
+
+        Opens the standalone vault file at ``path`` with
+        ``import_credentials``, re-encrypts every item found in it
+        with this manager's own secondary credentials, and adds the
+        result to ``vault`` in this manager (created empty first if
+        it does not exist yet).
+
+        Parameters
+        ----------
+        path : str or Path
+            Exported bundle to import, as written by
+            :meth:`_export_items` (or any other :class:`PasswordManager`
+            saved to a file).
+
+        vault : str, optional
+            Name of the vault in *this* manager the imported items
+            are added to. Created empty first if it does not already
+            exist. Defaults to ``"imported items"``.
+
+        import_credentials : Credentials
+            Primary and secondary password/iteration pairs the file
+            at ``path`` was encrypted with (i.e. the exporter's
+            ``export_credentials``).
+
+        Returns
+        -------
+        list of Item
+            The items actually added to ``vault``, in the order they
+            were read from ``path`` (see :meth:`add_item` for why an
+            added item's UUID might differ from its UUID in the
+            exported file).
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`decrypt_data` has not been called yet on
+            *this* manager.
+
+        OSError
+            If ``path`` cannot be read.
+
+        PrimaryPasswordError
+            If ``import_credentials``' primary password does not
+            match the one ``path`` was encrypted with.
+
+        SecondaryPasswordError
+            If ``import_credentials``' secondary password does not
+            match the one ``path`` was encrypted with.
+
+        VaultNotFoundError
+            If ``path`` does not contain an ``"exported items"``
+            vault (for instance, a vault file not produced by
+            :meth:`_export_items`).
+
+        Notes
+        -----
+        The file at ``path`` is opened through a throwaway
+        :class:`PasswordManager` of its own, decrypted with
+        ``import_credentials`` and verified with
+        :meth:`check_secondary`, exactly like opening any vault
+        file. Only its ``"exported items"`` vault is read: that is
+        the fixed name :meth:`_export_items` always writes to.
+
+        Each item is handled the same way as in :meth:`_export_items`,
+        mirrored: :meth:`Item.deepcopy` first (so the temporary
+        manager's own items are left untouched), then
+        :meth:`Item.change_credentials` from ``import_credentials``'
+        secondary credentials to this manager's own, before
+        :meth:`add_item` adds the copy to ``vault``.
+        """
+        with self._lock:
+            self._require_decrypted()
+
+            temp_manager = PasswordManager(
+                bytearray(Path(path).read_bytes()),
+                import_credentials,
+            )
+            temp_manager.decrypt_data()
+            temp_manager.check_secondary()
+
+            exported_vault = temp_manager.get_vault("exported items")
+
+            if vault not in self._vaults:
+                self.add_empty_vault(vault)
+
+            imported: list[Item] = []
+            for original in exported_vault.get_items():
+                duplicate = original.deepcopy()
+                duplicate.change_credentials(import_credentials, self._credentials)
+                imported.append(self.add_item(duplicate, vault))
+
+            return imported
+
+    # ----------------
     # Metadata
     # ----------------
 
@@ -1514,7 +1844,7 @@ class PasswordManager:
             If :meth:`decrypt_data` has not been called yet.
 
         TypeError
-            If ``value`` is neither a ``str`` nor ``None``.
+            If ``value`` is neither a ``str`` nor ``None``.vault
         """
         if value is not None and not isinstance(value, str):
             raise TypeError(f"value must be a string, not {type(value)}")

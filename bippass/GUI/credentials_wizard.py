@@ -52,14 +52,13 @@ from ..core.exceptions import (
 )
 from ..core.profiles import profile_path, list_existing_profiles
 
-from .manager_gui import PasswordManagerWindow
+from .manager_window import PasswordManagerWindow
 from .translate import translator, credentials_gui_translation, ENGLISH, FRENCH, SPANISH
 
 
 def _t(key: str, **kwargs: str) -> str:
     """Shorthand for ``translator.translate(key, credentials_gui_translation, **kwargs)``."""
     return translator.translate(key, credentials_gui_translation, **kwargs)
-
 
 MEMORY_FILE_PATH = Path.home() / ".bippass" / "recent.json"
 
@@ -386,33 +385,55 @@ class _FilePage(QWizardPage):
 class _PrimaryPage(QWizardPage):
     """
     Step 2: primary password.
-
+ 
     In "open" mode, entering it attempts
     :meth:`PasswordManager.decrypt_data`; a wrong password keeps the
     user on this page. In "create" mode, it is simply recorded (with
     a confirmation field) as the new vault's primary password.
     """
-
+ 
     def __init__(self, parent=None):
         super().__init__(parent)
-
+ 
         layout = QFormLayout(self)
-
+ 
         self.password_label = QLabel()
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.Password)
-        layout.addRow(self.password_label, self.password_edit)
-
+        self.password_toggle_btn = QPushButton()
+        self.password_toggle_btn.setObjectName("smallButton")
+        self.password_toggle_btn.clicked.connect(self._toggle_password_mask)
+        password_row = QHBoxLayout()
+        password_row.addWidget(self.password_edit)
+        password_row.addWidget(self.password_toggle_btn)
+        layout.addRow(self.password_label, password_row)
+ 
         self.confirm_password_label = QLabel()
         self.confirm_password_edit = QLineEdit()
         self.confirm_password_edit.setEchoMode(QLineEdit.Password)
-        layout.addRow(self.confirm_password_label, self.confirm_password_edit)
-
+        self.confirm_password_toggle_btn = QPushButton()
+        self.confirm_password_toggle_btn.setObjectName("smallButton")
+        self.confirm_password_toggle_btn.clicked.connect(self._toggle_confirm_password_mask)
+        confirm_password_row = QHBoxLayout()
+        confirm_password_row.addWidget(self.confirm_password_edit)
+        confirm_password_row.addWidget(self.confirm_password_toggle_btn)
+        layout.addRow(self.confirm_password_label, confirm_password_row)
+ 
         self._retranslate_ui()
-
+ 
     def initializePage(self) -> None:
         self._update_mode_texts()
-
+ 
+    def _toggle_password_mask(self) -> None:
+        masked = self.password_edit.echoMode() == QLineEdit.Password
+        self.password_edit.setEchoMode(QLineEdit.Normal if masked else QLineEdit.Password)
+        self.password_toggle_btn.setText(_t("hide" if masked else "show"))
+ 
+    def _toggle_confirm_password_mask(self) -> None:
+        masked = self.confirm_password_edit.echoMode() == QLineEdit.Password
+        self.confirm_password_edit.setEchoMode(QLineEdit.Normal if masked else QLineEdit.Password)
+        self.confirm_password_toggle_btn.setText(_t("hide" if masked else "show"))
+ 
     def _update_mode_texts(self) -> None:
         creating = self.wizard().mode == "create"
         self.setSubTitle(
@@ -420,12 +441,21 @@ class _PrimaryPage(QWizardPage):
         )
         self.confirm_password_label.setVisible(creating)
         self.confirm_password_edit.setVisible(creating)
-
+        self.confirm_password_toggle_btn.setVisible(creating)
+ 
     def _retranslate_ui(self) -> None:
         """Refresh every translated string on this page after a language change."""
         self.setTitle(_t("primary_page_title"))
         self.password_label.setText(_t("password_label"))
         self.confirm_password_label.setText(_t("confirm_password_label"))
+        self.password_toggle_btn.setToolTip(_t("show_hide_tooltip"))
+        self.password_toggle_btn.setText(
+            _t("hide" if self.password_edit.echoMode() == QLineEdit.Normal else "show")
+        )
+        self.confirm_password_toggle_btn.setToolTip(_t("show_hide_tooltip"))
+        self.confirm_password_toggle_btn.setText(
+            _t("hide" if self.confirm_password_edit.echoMode() == QLineEdit.Normal else "show")
+        )
         # `self.wizard()` is still None at construction time (before
         # `addPage` inserts this page into the wizard), and
         # `_update_mode_texts` needs `wizard().mode`: skip it then --
@@ -433,22 +463,22 @@ class _PrimaryPage(QWizardPage):
         # actually shown) runs it with a real wizard in place.
         if self.wizard() is not None:
             self._update_mode_texts()
-
+ 
     def validatePage(self) -> bool:
         wizard: CredentialsWizard = self.wizard()
         password = self.password_edit.text()
-
+ 
         if not password:
             QMessageBox.warning(self, _t("missing_fields_title"), _t("missing_fields_message"))
             return False
-
+ 
         if wizard.mode == "create":
             if password != self.confirm_password_edit.text():
                 QMessageBox.warning(self, _t("mismatch_title"), _t("mismatch_message"))
                 return False
             wizard.credentials.set_primary_password(bytearray(password.encode("utf-8")))
             return True
-
+ 
         # Open mode: try to actually decrypt with this password.
         wizard.credentials.set_primary_password(bytearray(password.encode("utf-8")))
         try:
@@ -472,12 +502,12 @@ class _PrimaryPage(QWizardPage):
             )
             return False
         return True
-
-
+ 
+ 
 class _SecondaryPage(QWizardPage):
     """
     Step 3: secondary password.
-
+ 
     In "open" mode, entering it attempts
     :meth:`PasswordManager.check_secondary`; a wrong password keeps
     the user on this page. In "create" mode, it is recorded (with
@@ -485,27 +515,49 @@ class _SecondaryPage(QWizardPage):
     right away via :meth:`PasswordManager.save_changes`, so nothing is
     lost even if the app closes before the user explicitly saves again.
     """
-
+ 
     def __init__(self, parent=None):
         super().__init__(parent)
-
+ 
         layout = QFormLayout(self)
-
+ 
         self.password_label = QLabel()
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.Password)
-        layout.addRow(self.password_label, self.password_edit)
-
+        self.password_toggle_btn = QPushButton()
+        self.password_toggle_btn.setObjectName("smallButton")
+        self.password_toggle_btn.clicked.connect(self._toggle_password_mask)
+        password_row = QHBoxLayout()
+        password_row.addWidget(self.password_edit)
+        password_row.addWidget(self.password_toggle_btn)
+        layout.addRow(self.password_label, password_row)
+ 
         self.confirm_password_label = QLabel()
         self.confirm_password_edit = QLineEdit()
         self.confirm_password_edit.setEchoMode(QLineEdit.Password)
-        layout.addRow(self.confirm_password_label, self.confirm_password_edit)
-
+        self.confirm_password_toggle_btn = QPushButton()
+        self.confirm_password_toggle_btn.setObjectName("smallButton")
+        self.confirm_password_toggle_btn.clicked.connect(self._toggle_confirm_password_mask)
+        confirm_password_row = QHBoxLayout()
+        confirm_password_row.addWidget(self.confirm_password_edit)
+        confirm_password_row.addWidget(self.confirm_password_toggle_btn)
+        layout.addRow(self.confirm_password_label, confirm_password_row)
+ 
         self._retranslate_ui()
-
+ 
     def initializePage(self) -> None:
         self._update_mode_texts()
-
+ 
+    def _toggle_password_mask(self) -> None:
+        masked = self.password_edit.echoMode() == QLineEdit.Password
+        self.password_edit.setEchoMode(QLineEdit.Normal if masked else QLineEdit.Password)
+        self.password_toggle_btn.setText(_t("hide" if masked else "show"))
+ 
+    def _toggle_confirm_password_mask(self) -> None:
+        masked = self.confirm_password_edit.echoMode() == QLineEdit.Password
+        self.confirm_password_edit.setEchoMode(QLineEdit.Normal if masked else QLineEdit.Password)
+        self.confirm_password_toggle_btn.setText(_t("hide" if masked else "show"))
+ 
     def _update_mode_texts(self) -> None:
         creating = self.wizard().mode == "create"
         self.setSubTitle(
@@ -513,24 +565,33 @@ class _SecondaryPage(QWizardPage):
         )
         self.confirm_password_label.setVisible(creating)
         self.confirm_password_edit.setVisible(creating)
-
+        self.confirm_password_toggle_btn.setVisible(creating)
+ 
     def _retranslate_ui(self) -> None:
         """Refresh every translated string on this page after a language change."""
         self.setTitle(_t("secondary_page_title"))
         self.password_label.setText(_t("password_label"))
         self.confirm_password_label.setText(_t("confirm_password_label"))
+        self.password_toggle_btn.setToolTip(_t("show_hide_tooltip"))
+        self.password_toggle_btn.setText(
+            _t("hide" if self.password_edit.echoMode() == QLineEdit.Normal else "show")
+        )
+        self.confirm_password_toggle_btn.setToolTip(_t("show_hide_tooltip"))
+        self.confirm_password_toggle_btn.setText(
+            _t("hide" if self.confirm_password_edit.echoMode() == QLineEdit.Normal else "show")
+        )
         # See the identical guard/comment in `_PrimaryPage._retranslate_ui`.
         if self.wizard() is not None:
             self._update_mode_texts()
-
+ 
     def validatePage(self) -> bool:
         wizard: CredentialsWizard = self.wizard()
         password = self.password_edit.text()
-
+ 
         if not password:
             QMessageBox.warning(self, _t("missing_fields_title"), _t("missing_fields_message"))
             return False
-
+ 
         if wizard.mode == "create":
             if password != self.confirm_password_edit.text():
                 QMessageBox.warning(self, _t("mismatch_title"), _t("mismatch_message"))
@@ -546,7 +607,7 @@ class _SecondaryPage(QWizardPage):
                 return False
             _remember_file_path(wizard.file_path)
             return True
-
+ 
         # Open mode: try to actually validate this password.
         wizard.credentials.set_secondary_password(bytearray(password.encode("utf-8")))
         try:
@@ -569,7 +630,7 @@ class _SecondaryPage(QWizardPage):
                 _t("unexpected_error_message", error_type=type(exc).__name__, error=exc),
             )
             return False
-
+ 
         _remember_file_path(wizard.file_path)
         return True
 

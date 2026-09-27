@@ -16,10 +16,5 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from .credential_gui import CredentialsWizard
-from .manager_gui import PasswordManagerWindow
-from .item_viewer import ItemViewer
-from .help_gui import HelpDialog
-from .generator_qt import GeneratorDialog
-from .theme import load_theme, save_theme, apply_theme
-from .translate import Translator
+from .credentials_wizard import CredentialsWizard
+from .manager_window import PasswordManagerWindow

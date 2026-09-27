@@ -663,6 +663,21 @@ manager_gui_translation: dict[str, dict[str, str]] = {
     },
 
     # -- Change credentials dialog -----------------------------------------------------
+    "show": {
+        "en": "Show",
+        "fr": "Afficher",
+        "es": "Mostrar",
+    },
+    "hide": {
+        "en": "Hide",
+        "fr": "Masquer",
+        "es": "Ocultar",
+    },
+    "show_hide_tooltip": {
+        "en": "Show / hide",
+        "fr": "Afficher / masquer",
+        "es": "Mostrar / ocultar",
+    },
     "credentials_dialog_title": {
         "en": "Change credentials",
         "fr": "Changer les identifiants",
@@ -724,6 +739,448 @@ manager_gui_translation: dict[str, dict[str, str]] = {
         "en": "Cancel",
         "fr": "Annuler",
         "es": "Cancelar",
+    },
+    "browse_button": {
+        "en": "Browse…",
+        "fr": "Parcourir…",
+        "es": "Examinar…",
+    },
+    "vault_files_filter": {
+        "en": "Vault files (*.vault *.pm *.bin *.encrypted);;All files (*)",
+        "fr": "Fichiers de coffre (*.vault *.pm *.bin *.encrypted);;Tous les fichiers (*)",
+        "es": "Archivos de caja fuerte (*.vault *.pm *.bin *.encrypted);;Todos los archivos (*)",
+    },
+
+    # -- Vault context menu (rename / delete) -----------------------------------
+    "rename_vault_action": {
+        "en": "Rename",
+        "fr": "Renommer",
+        "es": "Renombrar",
+    },
+    "delete_vault_action": {
+        "en": "Delete",
+        "fr": "Supprimer",
+        "es": "Eliminar",
+    },
+    "rename_vault_title": {
+        "en": "Rename vault",
+        "fr": "Renommer le coffre",
+        "es": "Renombrar caja fuerte",
+    },
+    "rename_vault_prompt": {
+        "en": 'New name for "{name}":',
+        "fr": 'Nouveau nom pour "{name}" :',
+        "es": 'Nuevo nombre para "{name}":',
+    },
+    "delete_vault_title": {
+        "en": "Delete vault",
+        "fr": "Supprimer le coffre",
+        "es": "Eliminar caja fuerte",
+    },
+    "delete_vault_prompt": {
+        "en": 'Permanently delete the empty vault "{vault}"?\nThis action cannot be undone.',
+        "fr": 'Supprimer définitivement le coffre vide "{vault}" ?\nCette action est irréversible.',
+        "es": '¿Eliminar permanentemente la caja fuerte vacía "{vault}"?\nEsta acción no se puede deshacer.',
+    },
+    "delete_vault_prompt_with_items": {
+        "en": 'Permanently delete the vault "{vault}" and all {count} item(s) it contains?\n'
+              "This action cannot be undone.",
+        "fr": 'Supprimer définitivement le coffre "{vault}" et ses {count} élément(s) ?\n'
+              "Cette action est irréversible.",
+        "es": '¿Eliminar permanentemente la caja fuerte "{vault}" y sus {count} elemento(s)?\n'
+              "Esta acción no se puede deshacer.",
+    },
+    "vault_icon_action": {
+        "en": "Icon…",
+        "fr": "Icône…",
+        "es": "Icono…",
+    },
+
+    # -- Vault icon dialog ---------------------------------------------------------
+    "vault_icon_dialog_title": {
+        "en": "Vault icon",
+        "fr": "Icône du coffre",
+        "es": "Icono de la caja fuerte",
+    },
+    "vault_icon_none_label": {
+        "en": "None",
+        "fr": "Aucune",
+        "es": "Ninguno",
+    },
+    "vault_icon_color_button": {
+        "en": "Choose color…",
+        "fr": "Choisir une couleur…",
+        "es": "Elegir un color…",
+    },
+
+    # -- Item context menu (rename / icon / duplicate) ----------------------------
+    "rename_item_action": {
+        "en": "Rename",
+        "fr": "Renommer",
+        "es": "Renombrar",
+    },
+    "rename_item_title": {
+        "en": "Rename item",
+        "fr": "Renommer l'élément",
+        "es": "Renombrar elemento",
+    },
+    "rename_item_prompt": {
+        "en": 'New name for "{name}":',
+        "fr": 'Nouveau nom pour "{name}" :',
+        "es": 'Nuevo nombre para "{name}":',
+    },
+    "item_icon_action": {
+        "en": "Icon…",
+        "fr": "Icône…",
+        "es": "Icono…",
+    },
+    "duplicate_action": {
+        "en": "Duplicate",
+        "fr": "Dupliquer",
+        "es": "Duplicar",
+    },
+
+    # -- Multi-item drag & drop ---------------------------------------------------
+    "move_items_prompt": {
+        "en": 'Move {count} items ({items}) from "{source}" to "{target}"?',
+        "fr": 'Déplacer {count} éléments ({items}) de "{source}" vers "{target}" ?',
+        "es": '¿Mover {count} elementos ({items}) de "{source}" a "{target}"?',
+    },
+
+    # -- Settings menu: Export / Import -------------------------------------------
+    "menu_export_action": {
+        "en": "Export…",
+        "fr": "Exporter…",
+        "es": "Exportar…",
+    },
+    "menu_import_action": {
+        "en": "Import…",
+        "fr": "Importer…",
+        "es": "Importar…",
+    },
+
+    # -- Export dialog -------------------------------------------------------------
+    "export_dialog_title": {
+        "en": "Export items",
+        "fr": "Exporter des éléments",
+        "es": "Exportar elementos",
+    },
+    "export_items_label": {
+        "en": "Select the items to export:",
+        "fr": "Sélectionnez les éléments à exporter :",
+        "es": "Seleccione los elementos a exportar:",
+    },
+    "export_primary_password_label": {
+        "en": "Primary password:",
+        "fr": "Mot de passe primaire :",
+        "es": "Contraseña primaria:",
+    },
+    "export_confirm_primary_password_label": {
+        "en": "Confirm primary password:",
+        "fr": "Confirmer le mot de passe primaire :",
+        "es": "Confirmar contraseña primaria:",
+    },
+    "export_secondary_password_label": {
+        "en": "Secondary password:",
+        "fr": "Mot de passe secondaire :",
+        "es": "Contraseña secundaria:",
+    },
+    "export_confirm_secondary_password_label": {
+        "en": "Confirm secondary password:",
+        "fr": "Confirmer le mot de passe secondaire :",
+        "es": "Confirmar contraseña secundaria:",
+    },
+    "export_destination_label": {
+        "en": "Destination file…",
+        "fr": "Fichier de destination…",
+        "es": "Archivo de destino…",
+    },
+    "select_export_file_dialog_title": {
+        "en": "Choose the export destination",
+        "fr": "Choisir le fichier de destination",
+        "es": "Elegir el archivo de destino",
+    },
+    "export_no_items_selected": {
+        "en": "Select at least one item to export.",
+        "fr": "Sélectionnez au moins un élément à exporter.",
+        "es": "Seleccione al menos un elemento para exportar.",
+    },
+    "export_missing_password": {
+        "en": "Both the primary and secondary passwords are required.",
+        "fr": "Les mots de passe primaire et secondaire sont tous deux requis.",
+        "es": "Se requieren tanto la contraseña primaria como la secundaria.",
+    },
+    "export_password_mismatch": {
+        "en": "A password and its confirmation do not match.",
+        "fr": "Un mot de passe et sa confirmation ne correspondent pas.",
+        "es": "Una contraseña y su confirmación no coinciden.",
+    },
+    "export_missing_destination": {
+        "en": "Choose a destination file.",
+        "fr": "Choisissez un fichier de destination.",
+        "es": "Elija un archivo de destino.",
+    },
+    "export_success_title": {
+        "en": "Export successful",
+        "fr": "Export réussi",
+        "es": "Exportación exitosa",
+    },
+    "export_success_message": {
+        "en": "Items exported to:\n{path}",
+        "fr": "Éléments exportés vers :\n{path}",
+        "es": "Elementos exportados a:\n{path}",
+    },
+    "export_error_message": {
+        "en": "Could not export the items:\n{error}",
+        "fr": "Impossible d'exporter les éléments :\n{error}",
+        "es": "No se pudieron exportar los elementos:\n{error}",
+    },
+
+    # -- Import dialog -------------------------------------------------------------
+    "import_dialog_title": {
+        "en": "Import items",
+        "fr": "Importer des éléments",
+        "es": "Importar elementos",
+    },
+    "import_file_label": {
+        "en": "File to import:",
+        "fr": "Fichier à importer :",
+        "es": "Archivo a importar:",
+    },
+    "import_primary_password_label": {
+        "en": "Primary password:",
+        "fr": "Mot de passe primaire :",
+        "es": "Contraseña primaria:",
+    },
+    "import_secondary_password_label": {
+        "en": "Secondary password:",
+        "fr": "Mot de passe secondaire :",
+        "es": "Contraseña secundaria:",
+    },
+    "import_vault_label": {
+        "en": "Import into vault:",
+        "fr": "Importer dans le coffre :",
+        "es": "Importar en la caja fuerte:",
+    },
+    "default_import_vault_name": {
+        "en": "imported items",
+        "fr": "éléments importés",
+        "es": "elementos importados",
+    },
+    "select_import_file_dialog_title": {
+        "en": "Choose the file to import",
+        "fr": "Choisir le fichier à importer",
+        "es": "Elegir el archivo a importar",
+    },
+    "import_missing_file": {
+        "en": "Choose a file to import.",
+        "fr": "Choisissez un fichier à importer.",
+        "es": "Elija un archivo a importar.",
+    },
+    "import_missing_password": {
+        "en": "Both the primary and secondary passwords are required.",
+        "fr": "Les mots de passe primaire et secondaire sont tous deux requis.",
+        "es": "Se requieren tanto la contraseña primaria como la secundaria.",
+    },
+    "import_missing_vault": {
+        "en": "Choose or enter a target vault.",
+        "fr": "Choisissez ou saisissez un coffre de destination.",
+        "es": "Elija o escriba una caja fuerte de destino.",
+    },
+    "import_read_error": {
+        "en": "Could not read the file:\n{error}",
+        "fr": "Impossible de lire le fichier :\n{error}",
+        "es": "No se pudo leer el archivo:\n{error}",
+    },
+    "import_success_title": {
+        "en": "Import successful",
+        "fr": "Import réussi",
+        "es": "Importación exitosa",
+    },
+    "import_success_message": {
+        "en": '{count} item(s) imported into "{vault}".',
+        "fr": '{count} élément(s) importé(s) dans "{vault}".',
+        "es": '{count} elemento(s) importado(s) en "{vault}".',
+    },
+
+    # -- Help Dialog --------------------------------------------------------------------------
+    "help_dialog_title": {
+        "en": "bippass -- Help",
+        "fr": "bippass -- Aide",
+        "es": "bippass -- Ayuda",
+    },
+    "close_button": {
+        "en": "Close",
+        "fr": "Fermer",
+        "es": "Cerrar",
+    },
+    "help_content": {
+        "en": """
+            <h2>Vaults</h2>
+            <p>Logins, passwords, and everything else are organized into <b>vaults</b>.
+            Vaults are listed on the left side of the window; click one to open it and
+            see its items on the right.</p>
+            <p>To create a new vault, click the add button at the bottom of the vault
+            list, on the left.</p>
+    
+            <h2>Items</h2>
+            <p>Each vault holds a list of <b>items</b> -- one entry per account or
+            credential set. Click an item to open it in read-only view; click
+            <b>Edit</b> to modify its fields.</p>
+            <ul>
+                <li>To add a new item to the open vault, click the add button at the
+                bottom of the item list, on the right.</li>
+                <li>Right-click an item for a quick "Open" / "Delete" menu.</li>
+                <li>In Edit mode, a password field has a <b>Generate</b> button to
+                create a random or memorable password.</li>
+                <li>Each item can carry its own icon, shown next to its name in the list.</li>
+            </ul>
+    
+            <h2>Search and sort</h2>
+            <p>Use the search box above the item list to filter items by name. The
+            sort controls next to it let you order items alphabetically,
+            alphanumerically, or by last-modified date.</p>
+    
+            <h2>Moving items between vaults</h2>
+            <p>Drag an item from the list and drop it onto another vault, on the
+            left, to move it there.</p>
+    
+            <h2>Saving and auto-lock</h2>
+            <p>Changes are kept in memory until you click <b>Save</b> in the toolbar,
+            or close the window. The application also auto-saves and locks itself
+            after a period of inactivity, configurable in Preferences.</p>
+    
+            <h2>The Settings menu</h2>
+            <ul>
+                <li><b>Metadata</b> -- edit the account username.</li>
+                <li><b>Credentials</b> -- change the primary or secondary password.</li>
+                <li><b>Preferences</b> -- theme, language, and the auto-close delay.</li>
+                <li><b>Help</b> -- this window.</li>
+            </ul>
+    
+            <h2>Keyboard shortcuts</h2>
+            <ul>
+                <li><b>Ctrl +</b> / <b>Ctrl =</b> -- Zoom in</li>
+                <li><b>Ctrl -</b> -- Zoom out</li>
+                <li><b>Ctrl 0</b> -- Reset zoom</li>
+            </ul>
+        """,
+        "fr": """
+            <h2>Coffres-forts</h2>
+            <p>Les identifiants, mots de passe et le reste sont organisés en
+            <b>coffres-forts</b>. Les coffres sont listés sur la partie gauche de la
+            fenêtre ; cliquez sur l'un d'eux pour l'ouvrir et voir ses éléments à
+            droite.</p>
+            <p>Pour créer un nouveau coffre, cliquez sur le bouton d'ajout en bas de
+            la liste des coffres, à gauche.</p>
+    
+            <h2>Éléments</h2>
+            <p>Chaque coffre-fort contient une liste d'<b>éléments</b> -- une entrée
+            par compte ou jeu d'identifiants. Cliquez sur un élément pour l'ouvrir en
+            lecture seule, ou sur <b>Modifier</b> pour éditer ses champs.</p>
+            <ul>
+                <li>Pour ajouter un nouvel élément au coffre ouvert, cliquez sur le
+                bouton d'ajout en bas de la liste des éléments, à droite.</li>
+                <li>Clic droit sur un élément pour un menu rapide "Ouvrir" / "Supprimer".</li>
+                <li>En mode édition, un champ mot de passe possède un bouton
+                <b>Générer</b> pour créer un mot de passe aléatoire ou facile à
+                retenir.</li>
+                <li>Chaque élément peut avoir sa propre icône, affichée à côté de son
+                nom dans la liste.</li>
+            </ul>
+    
+            <h2>Recherche et tri</h2>
+            <p>Utilisez le champ de recherche au-dessus de la liste des éléments pour
+            les filtrer par nom. Les contrôles de tri juste à côté permettent de les
+            ordonner par ordre alphabétique, alphanumérique, ou par date de dernière
+            modification.</p>
+    
+            <h2>Déplacer un élément entre coffres</h2>
+            <p>Glissez un élément de la liste et déposez-le sur un autre coffre, à
+            gauche, pour l'y déplacer.</p>
+    
+            <h2>Enregistrement et verrouillage automatique</h2>
+            <p>Les modifications restent en mémoire jusqu'à ce que vous cliquiez sur
+            <b>Enregistrer</b> dans la barre d'outils, ou que vous fermiez la
+            fenêtre. L'application s'enregistre et se verrouille aussi
+            automatiquement après une période d'inactivité, réglable dans les
+            Préférences.</p>
+    
+            <h2>Le menu Paramètres</h2>
+            <ul>
+                <li><b>Métadonnées</b> -- modifier le nom d'utilisateur du compte.</li>
+                <li><b>Identifiants</b> -- changer le mot de passe primaire ou secondaire.</li>
+                <li><b>Préférences</b> -- thème, langue, et délai de fermeture automatique.</li>
+                <li><b>Aide</b> -- cette fenêtre.</li>
+            </ul>
+    
+            <h2>Raccourcis clavier</h2>
+            <ul>
+                <li><b>Ctrl +</b> / <b>Ctrl =</b> -- Zoom avant</li>
+                <li><b>Ctrl -</b> -- Zoom arrière</li>
+                <li><b>Ctrl 0</b> -- Réinitialiser le zoom</li>
+            </ul>
+        """,
+        "es": """
+            <h2>Cajas fuertes</h2>
+            <p>Los inicios de sesión, contraseñas y demás se organizan en <b>cajas
+            fuertes</b>. Las cajas fuertes se listan en la parte izquierda de la
+            ventana; haga clic en una para abrirla y ver sus elementos a la
+            derecha.</p>
+            <p>Para crear una nueva caja fuerte, haga clic en el botón de añadir en
+            la parte inferior de la lista de cajas fuertes, a la izquierda.</p>
+    
+            <h2>Elementos</h2>
+            <p>Cada caja fuerte contiene una lista de <b>elementos</b> -- una entrada
+            por cuenta o conjunto de credenciales. Haga clic en un elemento para
+            abrirlo en modo solo lectura, o en <b>Editar</b> para modificar sus
+            campos.</p>
+            <ul>
+                <li>Para añadir un nuevo elemento a la caja fuerte abierta, haga clic
+                en el botón de añadir en la parte inferior de la lista de elementos,
+                a la derecha.</li>
+                <li>Clic derecho sobre un elemento para un menú rápido "Abrir" /
+                "Eliminar".</li>
+                <li>En modo edición, un campo de contraseña tiene un botón
+                <b>Generar</b> para crear una contraseña aleatoria o fácil de
+                recordar.</li>
+                <li>Cada elemento puede tener su propio icono, mostrado junto a su
+                nombre en la lista.</li>
+            </ul>
+    
+            <h2>Búsqueda y orden</h2>
+            <p>Use el campo de búsqueda encima de la lista de elementos para
+            filtrarlos por nombre. Los controles de orden justo al lado permiten
+            ordenarlos alfabéticamente, alfanuméricamente, o por fecha de última
+            modificación.</p>
+    
+            <h2>Mover elementos entre cajas fuertes</h2>
+            <p>Arrastre un elemento de la lista y suéltelo sobre otra caja fuerte, a
+            la izquierda, para moverlo allí.</p>
+    
+            <h2>Guardado y bloqueo automático</h2>
+            <p>Los cambios permanecen en memoria hasta que hace clic en
+            <b>Guardar</b> en la barra de herramientas, o cierra la ventana. La
+            aplicación también se guarda y se bloquea automáticamente tras un
+            período de inactividad, configurable en Preferencias.</p>
+    
+            <h2>El menú Ajustes</h2>
+            <ul>
+                <li><b>Metadatos</b> -- editar el nombre de usuario de la cuenta.</li>
+                <li><b>Credenciales</b> -- cambiar la contraseña primaria o
+                secundaria.</li>
+                <li><b>Preferencias</b> -- tema, idioma, y el retraso de cierre
+                automático.</li>
+                <li><b>Ayuda</b> -- esta ventana.</li>
+            </ul>
+    
+            <h2>Atajos de teclado</h2>
+            <ul>
+                <li><b>Ctrl +</b> / <b>Ctrl =</b> -- Acercar</li>
+                <li><b>Ctrl -</b> -- Alejar</li>
+                <li><b>Ctrl 0</b> -- Restablecer zoom</li>
+            </ul>
+        """,
     },
 }
 
@@ -1037,6 +1494,21 @@ credentials_gui_translation: dict[str, dict[str, str]] = {
     },
 
     # -- Primary / secondary credentials pages ---------------------------------
+    "show": {
+        "en": "Show",
+        "fr": "Afficher",
+        "es": "Mostrar",
+    },
+    "hide": {
+        "en": "Hide",
+        "fr": "Masquer",
+        "es": "Ocultar",
+    },
+    "show_hide_tooltip": {
+        "en": "Show / hide",
+        "fr": "Afficher / masquer",
+        "es": "Mostrar / ocultar",
+    },
     "primary_page_title": {
         "en": "Primary credentials",
         "fr": "Identifiants primaires",
@@ -1148,187 +1620,6 @@ credentials_gui_translation: dict[str, dict[str, str]] = {
 }
 
 
-#: Translations for the strings shown by `help_gui.py`.
-help_gui_translation: dict[str, dict[str, str]] = {
-    "help_dialog_title": {
-        "en": "bippass -- Help",
-        "fr": "bippass -- Aide",
-        "es": "bippass -- Ayuda",
-    },
-    "close_button": {
-        "en": "Close",
-        "fr": "Fermer",
-        "es": "Cerrar",
-    },
-    "help_content": {
-        "en": """
-            <h2>Vaults</h2>
-            <p>Logins, passwords, and everything else are organized into <b>vaults</b>.
-            Vaults are listed on the left side of the window; click one to open it and
-            see its items on the right.</p>
-            <p>To create a new vault, click the add button at the bottom of the vault
-            list, on the left.</p>
-    
-            <h2>Items</h2>
-            <p>Each vault holds a list of <b>items</b> -- one entry per account or
-            credential set. Click an item to open it in read-only view; click
-            <b>Edit</b> to modify its fields.</p>
-            <ul>
-                <li>To add a new item to the open vault, click the add button at the
-                bottom of the item list, on the right.</li>
-                <li>Right-click an item for a quick "Open" / "Delete" menu.</li>
-                <li>In Edit mode, a password field has a <b>Generate</b> button to
-                create a random or memorable password.</li>
-                <li>Each item can carry its own icon, shown next to its name in the list.</li>
-            </ul>
-    
-            <h2>Search and sort</h2>
-            <p>Use the search box above the item list to filter items by name. The
-            sort controls next to it let you order items alphabetically,
-            alphanumerically, or by last-modified date.</p>
-    
-            <h2>Moving items between vaults</h2>
-            <p>Drag an item from the list and drop it onto another vault, on the
-            left, to move it there.</p>
-    
-            <h2>Saving and auto-lock</h2>
-            <p>Changes are kept in memory until you click <b>Save</b> in the toolbar,
-            or close the window. The application also auto-saves and locks itself
-            after a period of inactivity, configurable in Preferences.</p>
-    
-            <h2>The Settings menu</h2>
-            <ul>
-                <li><b>Metadata</b> -- edit the account username.</li>
-                <li><b>Credentials</b> -- change the primary or secondary password.</li>
-                <li><b>Preferences</b> -- theme, language, and the auto-close delay.</li>
-                <li><b>Help</b> -- this window.</li>
-            </ul>
-    
-            <h2>Keyboard shortcuts</h2>
-            <ul>
-                <li><b>Ctrl +</b> / <b>Ctrl =</b> -- Zoom in</li>
-                <li><b>Ctrl -</b> -- Zoom out</li>
-                <li><b>Ctrl 0</b> -- Reset zoom</li>
-            </ul>
-        """,
-        "fr": """
-            <h2>Coffres-forts</h2>
-            <p>Les identifiants, mots de passe et le reste sont organisés en
-            <b>coffres-forts</b>. Les coffres sont listés sur la partie gauche de la
-            fenêtre ; cliquez sur l'un d'eux pour l'ouvrir et voir ses éléments à
-            droite.</p>
-            <p>Pour créer un nouveau coffre, cliquez sur le bouton d'ajout en bas de
-            la liste des coffres, à gauche.</p>
-    
-            <h2>Éléments</h2>
-            <p>Chaque coffre-fort contient une liste d'<b>éléments</b> -- une entrée
-            par compte ou jeu d'identifiants. Cliquez sur un élément pour l'ouvrir en
-            lecture seule, ou sur <b>Modifier</b> pour éditer ses champs.</p>
-            <ul>
-                <li>Pour ajouter un nouvel élément au coffre ouvert, cliquez sur le
-                bouton d'ajout en bas de la liste des éléments, à droite.</li>
-                <li>Clic droit sur un élément pour un menu rapide "Ouvrir" / "Supprimer".</li>
-                <li>En mode édition, un champ mot de passe possède un bouton
-                <b>Générer</b> pour créer un mot de passe aléatoire ou facile à
-                retenir.</li>
-                <li>Chaque élément peut avoir sa propre icône, affichée à côté de son
-                nom dans la liste.</li>
-            </ul>
-    
-            <h2>Recherche et tri</h2>
-            <p>Utilisez le champ de recherche au-dessus de la liste des éléments pour
-            les filtrer par nom. Les contrôles de tri juste à côté permettent de les
-            ordonner par ordre alphabétique, alphanumérique, ou par date de dernière
-            modification.</p>
-    
-            <h2>Déplacer un élément entre coffres</h2>
-            <p>Glissez un élément de la liste et déposez-le sur un autre coffre, à
-            gauche, pour l'y déplacer.</p>
-    
-            <h2>Enregistrement et verrouillage automatique</h2>
-            <p>Les modifications restent en mémoire jusqu'à ce que vous cliquiez sur
-            <b>Enregistrer</b> dans la barre d'outils, ou que vous fermiez la
-            fenêtre. L'application s'enregistre et se verrouille aussi
-            automatiquement après une période d'inactivité, réglable dans les
-            Préférences.</p>
-    
-            <h2>Le menu Paramètres</h2>
-            <ul>
-                <li><b>Métadonnées</b> -- modifier le nom d'utilisateur du compte.</li>
-                <li><b>Identifiants</b> -- changer le mot de passe primaire ou secondaire.</li>
-                <li><b>Préférences</b> -- thème, langue, et délai de fermeture automatique.</li>
-                <li><b>Aide</b> -- cette fenêtre.</li>
-            </ul>
-    
-            <h2>Raccourcis clavier</h2>
-            <ul>
-                <li><b>Ctrl +</b> / <b>Ctrl =</b> -- Zoom avant</li>
-                <li><b>Ctrl -</b> -- Zoom arrière</li>
-                <li><b>Ctrl 0</b> -- Réinitialiser le zoom</li>
-            </ul>
-        """,
-        "es": """
-            <h2>Cajas fuertes</h2>
-            <p>Los inicios de sesión, contraseñas y demás se organizan en <b>cajas
-            fuertes</b>. Las cajas fuertes se listan en la parte izquierda de la
-            ventana; haga clic en una para abrirla y ver sus elementos a la
-            derecha.</p>
-            <p>Para crear una nueva caja fuerte, haga clic en el botón de añadir en
-            la parte inferior de la lista de cajas fuertes, a la izquierda.</p>
-    
-            <h2>Elementos</h2>
-            <p>Cada caja fuerte contiene una lista de <b>elementos</b> -- una entrada
-            por cuenta o conjunto de credenciales. Haga clic en un elemento para
-            abrirlo en modo solo lectura, o en <b>Editar</b> para modificar sus
-            campos.</p>
-            <ul>
-                <li>Para añadir un nuevo elemento a la caja fuerte abierta, haga clic
-                en el botón de añadir en la parte inferior de la lista de elementos,
-                a la derecha.</li>
-                <li>Clic derecho sobre un elemento para un menú rápido "Abrir" /
-                "Eliminar".</li>
-                <li>En modo edición, un campo de contraseña tiene un botón
-                <b>Generar</b> para crear una contraseña aleatoria o fácil de
-                recordar.</li>
-                <li>Cada elemento puede tener su propio icono, mostrado junto a su
-                nombre en la lista.</li>
-            </ul>
-    
-            <h2>Búsqueda y orden</h2>
-            <p>Use el campo de búsqueda encima de la lista de elementos para
-            filtrarlos por nombre. Los controles de orden justo al lado permiten
-            ordenarlos alfabéticamente, alfanuméricamente, o por fecha de última
-            modificación.</p>
-    
-            <h2>Mover elementos entre cajas fuertes</h2>
-            <p>Arrastre un elemento de la lista y suéltelo sobre otra caja fuerte, a
-            la izquierda, para moverlo allí.</p>
-    
-            <h2>Guardado y bloqueo automático</h2>
-            <p>Los cambios permanecen en memoria hasta que hace clic en
-            <b>Guardar</b> en la barra de herramientas, o cierra la ventana. La
-            aplicación también se guarda y se bloquea automáticamente tras un
-            período de inactividad, configurable en Preferencias.</p>
-    
-            <h2>El menú Ajustes</h2>
-            <ul>
-                <li><b>Metadatos</b> -- editar el nombre de usuario de la cuenta.</li>
-                <li><b>Credenciales</b> -- cambiar la contraseña primaria o
-                secundaria.</li>
-                <li><b>Preferencias</b> -- tema, idioma, y el retraso de cierre
-                automático.</li>
-                <li><b>Ayuda</b> -- esta ventana.</li>
-            </ul>
-    
-            <h2>Atajos de teclado</h2>
-            <ul>
-                <li><b>Ctrl +</b> / <b>Ctrl =</b> -- Acercar</li>
-                <li><b>Ctrl -</b> -- Alejar</li>
-                <li><b>Ctrl 0</b> -- Restablecer zoom</li>
-            </ul>
-        """,
-    },
-}
 
 
 class Translator:
