@@ -18,370 +18,386 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
-import os
 import re
-from importlib import resources
+from typing import TYPE_CHECKING, Callable
 
-from ..core.item import Item
-from ..core.manager import PasswordManager
-from ..core.credentials import Credentials
-from ..core.totp import generate_totp_code
-
-from .translate import translator
-from .generator_dialog import GeneratorDialog
-
+from PyQt5.QtCore import QSize, Qt, QTimer, QUrl, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
+    QApplication,
+    QDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QPushButton,
+    QLayout,
     QLineEdit,
-    QTextEdit,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
     QMessageBox,
-    QFrame,
+    QPushButton,
     QScrollArea,
-    QToolBar,
     QSizePolicy,
-    QComboBox,
-    QApplication,
-    QFileDialog,
+    QTextEdit,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QSize, QUrl
-from PyQt5.QtGui import QPixmap, QDesktopServices
 
-#: Loose email/phone/website shape checks, used only to flag a
-#: VIEW-mode value that clearly doesn't look like one -- not strict
-#: validators.
+from ..core.totp import generate_totp_code
+from .common import _item_icon_or_default
+from .dialogs import CustomFieldDialog, GeneratorDialog, ItemIconDialog
+from .translate import translator
+from .widgets import refresh_style
+
+if TYPE_CHECKING:
+    from ..core.credentials import Credentials
+    from ..core.item import Item
+    from ..core.manager import PasswordManager
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Standard fields, in display order: (field, label key, is_secret).
+# All of them are lists; "totps" gets its own row class.
+_STANDARD_FIELDS = (
+    ("logins", "viewer.field_logins", False),
+    ("passwords", "viewer.field_passwords", True),
+    ("totps", "viewer.field_totps", True),
+    ("websites", "viewer.field_websites", False),
+    ("emails", "viewer.field_emails", False),
+    ("phones", "viewer.field_phones", False),
+)
+
+# Prefix of a custom field's key in `ItemViewer._field_rows`.
+_CUSTOM_PREFIX = "custom:"
+
+_ACTION_BUTTON_HEIGHT = 32
+_SMALL_BUTTON_SIZE_PX = 28
+_ICON_PREVIEW_SIZE_PX = 56
+_FLASH_DURATION_MS = 350
+_TOTP_REFRESH_MS = 1000
+
+# Masked secrets always show this many bullets, not to leak their length.
+_MASK_LENGTH = 12
+
+# Loose shape checks, only used to flag values that obviously aren't an
+# email, a phone number or a website -- not strict validators.
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_RE = re.compile(r"^\+?[0-9][0-9\s.\-()]{5,}$")
-#: Optional scheme, a host with at least one dot (or "localhost"),
-#: optional port, optional path/query/fragment. Loose on purpose --
-#: this only flags values that obviously aren't a website address
-#: (e.g. a stray word or an unrelated note), not a strict URL grammar.
 _WEBSITE_RE = re.compile(
-    r"^(https?://)?"
-    r"([\w-]+(\.[\w-]+)+|localhost)"
-    r"(:\d+)?"
-    r"([/?#].*)?$"
+    r"^(https?://)?" r"([\w-]+(\.[\w-]+)+|localhost)" r"(:\d+)?" r"([/?#].*)?$"
 )
 
 
-def _looks_like_email(value: str) -> bool:
-    return bool(_EMAIL_RE.match(value.strip()))
-
-
-def _looks_like_phone(value: str) -> bool:
-    return bool(_PHONE_RE.match(value.strip()))
-
-
-def _looks_like_website(value: str) -> bool:
-    return bool(_WEBSITE_RE.match(value.strip()))
-
-
 # ---------------------------------------------------------------------------
-# Icon resolution
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def _icons_directory() -> str:
+def _clear_layout(layout: QLayout) -> None:
     """
-    Path to the package's bundled ``resources/item_icons`` directory.
-
-    Returns
-    -------
-    str
-        The directory path, or ``""`` if the package's resources
-        cannot be located.
-    """
-    try:
-        ref = resources.files("bippass").joinpath("resources/item_icons")
-        with resources.as_file(ref) as path:
-            return str(path)
-    except (ModuleNotFoundError, FileNotFoundError, OSError):
-        return ""
-
-
-def _resolve_icon_path(path: str) -> str:
-    """
-    Resolve a bare icon filename against the bundled icons directory.
-
-    A path that already has a directory component is returned
-    unchanged. A path that is only a filename (e.g. ``"github.png"``)
-    is looked up inside ``resources/item_icons`` instead of being treated
-    as relative to the current working directory.
+    Remove and delete every widget of a layout.
 
     Parameters
     ----------
-    path : str
-        Stored icon path or filename.
+    layout : QLayout
+        Layout to empty.
+    """
+    while layout.count():
+        widget = layout.takeAt(0).widget()
+        if widget is not None:
+            widget.deleteLater()
+
+
+def _to_clear_lines(value) -> list[str]:
+    """
+    Normalize a value returned by :class:`Item` into clear-text lines.
+
+    Parameters
+    ----------
+    value : None, str, bytearray or list of those
+        Scalar or list value, clear or decrypted.
 
     Returns
     -------
-    str
-        The resolved path, or ``path`` unchanged if it isn't a bare
-        filename or the package's resources can't be located.
+    list of str
+        One string per value, empty if ``value`` is ``None``.
     """
-    head, tail = os.path.split(path)
-    if head:
-        return path
-    try:
-        ref = resources.files("bippass").joinpath("resources/item_icons", tail)
-        with resources.as_file(ref) as resolved:
-            return str(resolved)
-    except (ModuleNotFoundError, FileNotFoundError, OSError):
-        return path
-
-
-def _valid_icon_pixmap(path: str | None) -> QPixmap | None:
-    """
-    Load an icon pixmap if, and only if, ``path`` points to an
-    existing file that Qt can interpret as a valid image.
-
-    Returns
-    -------
-    QPixmap or None
-        The loaded pixmap, or ``None`` if the path is empty,
-        nonexistent, or does not correspond to a readable image.
-    """
-    if not path:
-        return None
-    try:
-        if not os.path.isfile(path):
-            return None
-        pixmap = QPixmap(path)
-    except OSError:
-        # e.g. WinError 59 (unexpected network error) when `path`
-        # sits on a network drive/share that hiccups mid-lookup --
-        # treated the same as "unreadable", never a crash.
-        return None
-    if pixmap.isNull():
-        return None
-    return pixmap
-
-
-def _default_icon_pixmap() -> QPixmap | None:
-    """
-    Load the package's bundled fallback icon
-    (``bippass/resources/item_icons/_default.png``).
-
-    Uses ``importlib.resources`` rather than a path computed from
-    ``__file__``: it goes through the import system's own loader
-    instead of manual path arithmetic, so it doesn't care how the
-    package is laid out on disk (plain directory, zipped, etc.) and
-    doesn't do its own filesystem resolution at import time -- see
-    the ``.resolve()`` crash this replaced.
-
-    Returns
-    -------
-    QPixmap or None
-        The bundled icon, or ``None`` if the package's resources are
-        missing or unreadable (e.g. removed from the install, or a
-        transient network error if the package itself sits on a
-        network drive/share).
-    """
-    try:
-        ref = resources.files("bippass").joinpath("resources/item_icons/_default.png")
-        with resources.as_file(ref) as path:
-            return _valid_icon_pixmap(str(path))
-    except (ModuleNotFoundError, FileNotFoundError, OSError):
-        return None
-
-
-def _icon_pixmap_or_default(path: str | None) -> QPixmap | None:
-    """
-    Load the icon at ``path``, falling back to the bundled default
-    icon if ``path`` is empty or does not point to a readable image.
-
-    A bare filename (no directory component) is first resolved
-    against the bundled ``resources/item_icons`` directory (see
-    :func:`_resolve_icon_path`).
-
-    Returns
-    -------
-    QPixmap or None
-        The loaded pixmap for ``path``, the bundled default icon, or
-        ``None`` if neither can be read (e.g. the package's own
-        resources are missing -- callers should still handle this).
-    """
-    resolved = _resolve_icon_path(path) if path else path
-    pixmap = _valid_icon_pixmap(resolved)
-    if pixmap is not None:
-        return pixmap
-    return _default_icon_pixmap()
+    if value is None:
+        return []
+    values = value if isinstance(value, list) else [value]
+    return [
+        bytes(v).decode("utf-8") if isinstance(v, (bytes, bytearray)) else str(v) for v in values
+    ]
 
 
 # ---------------------------------------------------------------------------
-# Basic widgets
+# Value labels
 # ---------------------------------------------------------------------------
 #
-# None of the widgets below set their own colors: they're styled by
-# the app-wide QSS in `theme.py`, keyed on their Python class name
-# (FieldRow, ClickToCopyLabel, WebsiteLabel, IconPreview) or on an
-# object name for plain Qt widgets (e.g. "smallButton", "mutedLabel").
-# This is what lets a single `apply_theme(app, ...)` call re-style the
-# whole item viewer, not just the top-level window.
+# No widget below sets its own colors: `theme.py` styles them by class
+# name (FieldRow, ClickToCopyLabel, IconPreview...) or object name
+# ("smallButton", "mutedLabel"...), so `apply_theme` re-styles them all.
 
 
 class ClickToCopyLabel(QLabel):
     """
-    Clickable label that copies a value (which may differ from the
-    displayed text, e.g. when the latter is masked) to the clipboard
-    on click.
+    Label copying a value to the clipboard when clicked.
+
+    The copied value may differ from the displayed text, e.g. when the
+    latter is masked. A click briefly switches the QSS ``state``
+    property to ``"flash"`` as feedback.
+
+    Parameters
+    ----------
+    display_text : str, optional
+        Text shown in the label.
+    copy_text : str, optional
+        Value copied on click. Nothing is copied if empty.
+    parent : QWidget, optional
+        Parent widget.
     """
 
     def __init__(self, display_text: str = "", copy_text: str = "", parent=None):
         super().__init__(display_text, parent)
         self._copy_text = copy_text
-        # The state this label sits at once the flash feedback below
-        # fades -- "" normally, "warning" for a value flagged by
-        # `_make_view_widget` as not looking like a valid
-        # email/phone/website. Tracked separately from the QSS
-        # "state" property itself because `_flash_feedback` briefly
-        # overrides that property and must restore *this*, not
-        # unconditionally clear it.
         self._base_state = ""
         self.setWordWrap(True)
         self.setCursor(Qt.PointingHandCursor)
         self.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
     def set_copy_text(self, text: str) -> None:
-        """Sets the value actually copied on click (never the masked text)."""
+        """
+        Set the value copied on click.
+
+        Parameters
+        ----------
+        text : str
+            Value to copy, never the masked text.
+        """
         self._copy_text = text
 
     def set_base_state(self, state: str) -> None:
         """
-        Sets the persistent QSS ``state`` (e.g. ``"warning"``), as
-        opposed to the transient ``"flash"`` state applied on click --
-        see :attr:`_base_state`.
+        Set the persistent QSS ``state`` of the label.
+
+        Parameters
+        ----------
+        state : str
+            ``""`` or ``"warning"``. It is restored after the transient
+            ``"flash"`` state of a click.
         """
         self._base_state = state
         self.setProperty("state", state)
-        self.style().unpolish(self)
-        self.style().polish(self)
+        refresh_style(self)
 
-    def mousePressEvent(self, event):
+    def mousePressEvent(self, event) -> None:
+        """
+        Copy the value on a left click.
+
+        Parameters
+        ----------
+        event : QMouseEvent
+            The press event.
+        """
         if event.button() == Qt.LeftButton and self._copy_text:
             QApplication.clipboard().setText(self._copy_text)
             self._flash_feedback()
         super().mousePressEvent(event)
 
     def _flash_feedback(self) -> None:
-        # Briefly switch to the `[state="flash"]` QSS rule (a themed
-        # "success" color) instead of hardcoding one here, then
-        # restore `_base_state` (not unconditionally clear it --
-        # that would wipe out a "warning" state set by
-        # `_make_view_widget`) -- `unpolish`/`polish` forces Qt to
-        # re-evaluate the QSS for this widget after the dynamic
-        # property changes.
+        """Briefly switch to the ``"flash"`` state, then restore the base one."""
         self.setProperty("state", "flash")
-        self.style().unpolish(self)
-        self.style().polish(self)
+        refresh_style(self)
+        QTimer.singleShot(_FLASH_DURATION_MS, self._restore_state)
 
-        def _clear_flash() -> None:
-            self.setProperty("state", self._base_state)
-            self.style().unpolish(self)
-            self.style().polish(self)
-
-        QTimer.singleShot(350, _clear_flash)
+    def _restore_state(self) -> None:
+        """Restore the persistent QSS state after a flash."""
+        self.setProperty("state", self._base_state)
+        refresh_style(self)
 
 
 class ActionableLabel(ClickToCopyLabel):
     """
-    Base class for a :class:`ClickToCopyLabel` that can also be
-    opened with an external application.
+    :class:`ClickToCopyLabel` that can also be opened with an external
+    application.
 
-    A single click still copies the value, as inherited from
-    :class:`ClickToCopyLabel`. A double click asks for confirmation
-    and, if accepted, opens the URL built by :meth:`_build_url`.
-    Subclasses set :attr:`_open_prompt_key` (a
-    ``translate.item_viewer_translation`` key) and implement
-    :meth:`_build_url`.
+    A click copies the value; a double click asks for confirmation and
+    opens the URL built by :meth:`_build_url`. Subclasses set
+    :attr:`_open_prompt_key` and implement :meth:`_build_url`.
+
+    Parameters
+    ----------
+    display_text : str, optional
+        Text shown in the label.
+    copy_text : str, optional
+        Value copied on click and opened on double click.
+    parent : QWidget, optional
+        Parent widget.
     """
 
-    _open_prompt_key = "open_website_prompt"
+    _open_prompt_key = "viewer.open_website_prompt"
 
     def _build_url(self, value: str) -> str:
+        """
+        Build the URL opening a value.
+
+        Parameters
+        ----------
+        value : str
+            The label's value.
+
+        Returns
+        -------
+        str
+            URL passed to :meth:`QDesktopServices.openUrl`.
+        """
         raise NotImplementedError
 
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.LeftButton and self._copy_text:
-            reply = QMessageBox.question(
-                self,
-                translator.translate("open_link_title"),
-                f"{translator.translate(self._open_prompt_key)}\n\n{self._copy_text}",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply == QMessageBox.Yes:
-                url = self._build_url(self._copy_text)
-                if not QDesktopServices.openUrl(QUrl(url)):
-                    QMessageBox.warning(
-                        self,
-                        translator.translate("link_unavailable_title"),
-                        translator.translate("link_unavailable_message"),
-                    )
+    def mouseDoubleClickEvent(self, event) -> None:
+        """
+        Ask for confirmation, then open the value, on a left double click.
+
+        Parameters
+        ----------
+        event : QMouseEvent
+            The double-click event.
+        """
+        if event.button() != Qt.LeftButton or not self._copy_text:
+            super().mouseDoubleClickEvent(event)
             return
-        super().mouseDoubleClickEvent(event)
+        reply = QMessageBox.question(
+            self,
+            translator.translate("viewer.open_link_title"),
+            f"{translator.translate(self._open_prompt_key)}\n\n{self._copy_text}",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        if not QDesktopServices.openUrl(QUrl(self._build_url(self._copy_text))):
+            QMessageBox.warning(
+                self,
+                translator.translate("viewer.link_unavailable_title"),
+                translator.translate("viewer.link_unavailable_message"),
+            )
 
 
 class WebsiteLabel(ActionableLabel):
-    """Website value: double click asks to open the link in a browser."""
+    """Website value, opened in the browser on double click."""
 
-    _open_prompt_key = "open_website_prompt"
+    _open_prompt_key = "viewer.open_website_prompt"
 
     def _build_url(self, value: str) -> str:
+        """
+        Build the URL of a website.
+
+        Parameters
+        ----------
+        value : str
+            Website address.
+
+        Returns
+        -------
+        str
+            The address unchanged.
+        """
         return value
 
 
 class EmailLabel(ActionableLabel):
-    """Email value: double click asks to open it in the mail application."""
+    """Email value, opened in the mail application on double click."""
 
-    _open_prompt_key = "open_email_prompt"
+    _open_prompt_key = "viewer.open_email_prompt"
 
     def _build_url(self, value: str) -> str:
+        """
+        Build the ``mailto:`` URL of an email address.
+
+        Parameters
+        ----------
+        value : str
+            Email address.
+
+        Returns
+        -------
+        str
+            ``"mailto:<value>"``.
+        """
         return f"mailto:{value}"
 
 
 class PhoneLabel(ActionableLabel):
-    """Phone value: double click asks to call it with the phone application."""
+    """Phone value, called with the phone application on double click."""
 
-    _open_prompt_key = "open_phone_prompt"
+    _open_prompt_key = "viewer.open_phone_prompt"
 
     def _build_url(self, value: str) -> str:
+        """
+        Build the ``tel:`` URL of a phone number.
+
+        Parameters
+        ----------
+        value : str
+            Phone number.
+
+        Returns
+        -------
+        str
+            ``"tel:<value>"``.
+        """
         return f"tel:{value}"
+
+
+# Actionable fields: (label class, shape check, tooltip key if invalid).
+_ACTIONABLE_FIELDS: dict[str, tuple[type[ActionableLabel], re.Pattern, str]] = {
+    "websites": (WebsiteLabel, _WEBSITE_RE, "viewer.invalid_website_tooltip"),
+    "emails": (EmailLabel, _EMAIL_RE, "viewer.invalid_email_tooltip"),
+    "phones": (PhoneLabel, _PHONE_RE, "viewer.invalid_phone_tooltip"),
+}
+
+
+# ---------------------------------------------------------------------------
+# Field rows
+# ---------------------------------------------------------------------------
 
 
 class FieldRow(QFrame):
     """
-    A row representing an item field (standard or custom), handling
-    both the VIEW mode display (read-only, copyable, secret masking)
-    and EDIT mode editing.
+    Row showing and editing one item field, standard or custom.
 
-    A list field (``is_list=True``, not custom) is edited as a
-    dynamic set of individual value rows in EDIT mode, each with its
-    own remove button, plus an "Add value" button to append a new
-    one -- values can be added or removed freely, not just those
-    already present.
+    In VIEW mode, each value is a read-only, click-to-copy label, and
+    secrets are masked behind a "Show"/"Hide" button. In EDIT mode, the
+    field is edited as:
+
+    - a list of value rows, each removable, plus "Add value" (and
+      "Generate" for passwords) buttons, for a standard list field;
+    - a multi-line text box, for a custom field;
+    - a single line, otherwise.
 
     Parameters
     ----------
     field_name : str
-        Internal identifier of the field (standard field name, or
-        ``"custom:<name>"`` for a custom field).
+        Standard field name, or ``"custom:<name>"`` for a custom field.
     label_text : str
-        Label shown to the user.
+        Label shown above the values.
     is_list : bool, optional
-        Field that can hold several values, each individually
-        addable/removable in EDIT mode.
+        Whether the field holds several values. Default is ``False``.
     is_secret : bool, optional
-        Encrypted field: masked by default in VIEW, with a
-        show/hide toggle button.
+        Whether the values are masked in VIEW mode. Default is ``False``.
     is_custom : bool, optional
-        Custom field: always edited as a ``QTextEdit`` (multi-line
-        notes allowed) and a remove button shown in EDIT mode.
+        Whether the field is a custom field, removable in EDIT mode.
+        Default is ``False``.
+    is_password : bool, optional
+        Whether to offer the password generator in EDIT mode. Default
+        is ``False``.
+    parent : QWidget, optional
+        Parent widget.
+
+    Attributes
+    ----------
+    remove_requested : pyqtSignal(str)
+        Emitted with :attr:`field_name` when the remove button of a
+        custom field is clicked.
     """
 
     remove_requested = pyqtSignal(str)
@@ -403,11 +419,9 @@ class FieldRow(QFrame):
         self.is_secret = is_secret
         self.is_custom = is_custom
         self.is_password = is_password
+
         self._masked = is_secret
         self._clear_lines: list[str] = []
-        # A custom field is edited as a multi-line QTextEdit (notes);
-        # a non-custom list field gets its own per-value rows instead
-        # (see `_add_entry_row`); a standard scalar is a QLineEdit.
         self._use_textarea_edit = is_custom
         self._use_list_edit = is_list and not is_custom
         self._entry_edits: list[QLineEdit] = []
@@ -415,8 +429,6 @@ class FieldRow(QFrame):
         self._edit_mode_active = False
 
         self.setFrameShape(QFrame.StyledPanel)
-        # Colors/border come from the `FieldRow { ... }` rule in
-        # theme.py, matched by this class's name.
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 6, 8, 6)
@@ -428,27 +440,18 @@ class FieldRow(QFrame):
         header.addWidget(self.label)
         header.addStretch()
 
-        self.eye_btn = QPushButton(translator.translate("show"))
-        self.eye_btn.setObjectName("smallButton")
-        self.eye_btn.setToolTip(translator.translate("show_hide_tooltip"))
-        self.eye_btn.setVisible(False)
+        self.eye_btn = self._small_button(
+            translator.translate("common.show"), "common.show_hide_tooltip"
+        )
         self.eye_btn.clicked.connect(self._toggle_mask)
         header.addWidget(self.eye_btn)
 
-        self.remove_btn = QPushButton("✕")
-        self.remove_btn.setObjectName("smallButton")
-        self.remove_btn.setFixedSize(28, 28)
-        self.remove_btn.setToolTip(translator.translate("remove_field_tooltip"))
-        self.remove_btn.setVisible(False)
-        self.remove_btn.clicked.connect(
-            lambda: self.remove_requested.emit(self.field_name)
-        )
+        self.remove_btn = self._small_button("✕", "viewer.remove_field_tooltip", square=True)
+        self.remove_btn.clicked.connect(lambda: self.remove_requested.emit(self.field_name))
         header.addWidget(self.remove_btn)
 
         outer.addLayout(header)
 
-        # One widget per value in VIEW mode, so each value can be
-        # copied (or, for a website/email/phone, opened) independently.
         self.view_container = QVBoxLayout()
         self.view_container.setSpacing(4)
         outer.addLayout(self.view_container)
@@ -463,224 +466,208 @@ class FieldRow(QFrame):
         self.edit_text.textChanged.connect(self._auto_resize_edit_text)
         outer.addWidget(self.edit_text)
 
-        # Per-value rows for a (non-custom) list field in EDIT mode.
         self.entries_container = QVBoxLayout()
         self.entries_container.setSpacing(4)
         outer.addLayout(self.entries_container)
 
         entry_buttons_row = QHBoxLayout()
-
-        self.add_entry_btn = QPushButton(translator.translate("add_value_button"))
-        self.add_entry_btn.setObjectName("smallButton")
-        self.add_entry_btn.setVisible(False)
+        self.add_entry_btn = self._small_button(translator.translate("viewer.add_value_button"))
         self.add_entry_btn.clicked.connect(lambda: self._add_entry_row(""))
         entry_buttons_row.addWidget(self.add_entry_btn)
 
-        # Only the "passwords" field gets a "Generate" button: it
-        # opens `GeneratorDialog` and, if a password is produced, adds
-        # it as one more entry row -- same effect as typing it in by
-        # hand into a fresh "+ Add value" row.
-        self.generate_btn = QPushButton(
-            translator.translate("generate_password_button")
-        )
-        self.generate_btn.setObjectName("smallButton")
-        self.generate_btn.setVisible(False)
+        self.generate_btn = self._small_button(translator.translate("viewer.generate_password"))
         self.generate_btn.clicked.connect(self._open_generator)
         entry_buttons_row.addWidget(self.generate_btn)
-
         entry_buttons_row.addStretch()
         outer.addLayout(entry_buttons_row)
 
-    # -- Value -----------------------------------------------------------
+    @staticmethod
+    def _small_button(text: str, tooltip_key: str = "", square: bool = False) -> QPushButton:
+        """
+        Build a hidden "smallButton" styled button.
+
+        Parameters
+        ----------
+        text : str
+            Button text.
+        tooltip_key : str, optional
+            Translation key of the tooltip, none if empty.
+        square : bool, optional
+            Whether to give the button a fixed square size.
+
+        Returns
+        -------
+        QPushButton
+            The new, hidden button.
+        """
+        button = QPushButton(text)
+        button.setObjectName("smallButton")
+        if tooltip_key:
+            button.setToolTip(translator.translate(tooltip_key))
+        if square:
+            button.setFixedSize(_SMALL_BUTTON_SIZE_PX, _SMALL_BUTTON_SIZE_PX)
+        button.setVisible(False)
+        return button
+
+    # -- Value --------------------------------------------------------------
 
     def set_value(self, clear_lines: list[str]) -> None:
         """
-        Sets the clear-text value of the field.
+        Set the clear-text value(s) of the field.
 
         Parameters
         ----------
         clear_lines : list of str
-            A single entry for a scalar field, several for a list
-            field. Empty list if the field has no value.
+            One entry for a scalar field, one per value for a list
+            field, empty if the field has no value.
         """
         self._clear_lines = list(clear_lines)
         self._refresh_view()
-        self._refresh_edit()
+        self.set_edit_values(self._clear_lines)
 
     def get_edit_values(self) -> list[str]:
         """
-        Retrieves the value(s) entered in edit mode.
+        Return the value(s) entered in EDIT mode.
 
         Returns
         -------
         list of str
-            For a list field: one entry per non-empty per-value row.
-            For a scalar field (including custom multi-line notes):
-            a single-element list.
+            One entry per non-empty value row for a list field, a
+            single entry otherwise.
         """
         if self._use_list_edit:
-            return [
-                edit.text().strip()
-                for edit in self._entry_edits
-                if edit.text().strip() != ""
-            ]
-        raw = (
-            self.edit_text.toPlainText()
-            if self._use_textarea_edit
-            else self.edit_line.text()
-        )
-        return [raw]
+            return [edit.text().strip() for edit in self._entry_edits if edit.text().strip()]
+        if self._use_textarea_edit:
+            return [self.edit_text.toPlainText()]
+        return [self.edit_line.text()]
 
     def set_edit_values(self, values: list[str]) -> None:
         """
-        Populate the EDIT-mode widget(s) directly with ``values``,
-        without touching :attr:`_clear_lines` (the VIEW-mode data).
- 
+        Fill the EDIT-mode widgets, leaving the VIEW-mode value unchanged.
+
         Parameters
         ----------
         values : list of str
-            Same shape :meth:`get_edit_values` returns: one entry per
-            row for a list field, a single-element list otherwise.
- 
+            Same shape as returned by :meth:`get_edit_values`.
+
         Notes
         -----
-        Used to restore in-progress, unsaved edits after the row is
-        rebuilt for an unrelated reason -- see
-        :meth:`ItemViewer._refresh_display_preserving_edits`, which
-        this is the counterpart of.
+        Also used to restore unsaved edits after the row was rebuilt,
+        see :meth:`ItemViewer.refresh`.
         """
         if self._use_list_edit:
-            self._clear_entries()
+            _clear_layout(self.entries_container)
+            self._entry_edits.clear()
             for value in values:
                 self._add_entry_row(value)
         elif self._use_textarea_edit:
             self.edit_text.blockSignals(True)
-            self.edit_text.setPlainText(values[0] if values else "")
+            self.edit_text.setPlainText("\n".join(values))
             self.edit_text.blockSignals(False)
             self._auto_resize_edit_text()
         else:
-            self.edit_line.setText(values[0] if values else "")
-            self._apply_edit_mask()
+            self.edit_line.setText("\n".join(values))
 
     def is_empty(self) -> bool:
-        return len(self._clear_lines) == 0
+        """
+        Tell whether the field has no value.
 
-    # -- Display -----------------------------------------------------------
+        Returns
+        -------
+        bool
+            ``True`` if the field holds no value.
+        """
+        return not self._clear_lines
 
-    def _display_lines(self) -> list[str]:
-        if not self._clear_lines:
-            return []
+    # -- VIEW mode ----------------------------------------------------------
+
+    def _view_entries(self) -> list[tuple[str, str]]:
+        """
+        Return the values to show in VIEW mode.
+
+        Returns
+        -------
+        list of (str, str)
+            ``(display_text, copy_text)`` per value; the display text
+            is a fixed-length mask while the secret is masked.
+        """
         if self.is_secret and self._masked:
-            # Fixed length so as not to leak the real length of the secret.
-            return ["•" * 12 for _ in self._clear_lines]
-        return self._clear_lines
+            return [("•" * _MASK_LENGTH, line) for line in self._clear_lines]
+        return [(line, line) for line in self._clear_lines]
 
     def _refresh_view(self) -> None:
-        self._clear_view_widgets()
-        lines = self._display_lines()
-
-        if not lines:
-            self.view_container.addWidget(self._make_empty_placeholder())
-        else:
-            for i, line in enumerate(lines):
-                copy_text = self._clear_lines[i] if i < len(self._clear_lines) else line
-                widget = self._make_view_widget(line, copy_text)
-                self.view_container.addWidget(widget)
-                self._view_widgets.append(widget)
-
-        self.eye_btn.setVisible(self.is_secret)
-        self.eye_btn.setText(translator.translate("show" if self._masked else "hide"))
-
-    def _clear_view_widgets(self) -> None:
-        while self.view_container.count():
-            item = self.view_container.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+        """Rebuild the VIEW-mode widgets from the current value."""
+        _clear_layout(self.view_container)
         self._view_widgets.clear()
 
-    def _make_empty_placeholder(self) -> QWidget:
-        placeholder = QLabel(translator.translate("empty_value_placeholder"))
-        placeholder.setObjectName("mutedLabel")
-        self._view_widgets.append(placeholder)
-        return placeholder
+        entries = self._view_entries()
+        if not entries:
+            placeholder = QLabel(translator.translate("viewer.empty_value_placeholder"))
+            placeholder.setObjectName("mutedLabel")
+            self._view_widgets.append(placeholder)
+        for display_text, copy_text in entries:
+            self._view_widgets.append(self._make_view_widget(display_text, copy_text))
+
+        for widget in self._view_widgets:
+            self.view_container.addWidget(widget)
+            widget.setVisible(not self._edit_mode_active)
+
+        self.eye_btn.setVisible(self.is_secret and not self._edit_mode_active)
+        self.eye_btn.setText(translator.translate("common.show" if self._masked else "common.hide"))
 
     def _make_view_widget(self, display_text: str, copy_text: str) -> QWidget:
         """
-        Build the VIEW-mode widget for a single value, one call per
-        line so each value can be copied (or opened) independently of
-        the others.
+        Build the VIEW-mode widget of one value.
+
+        Websites, emails and phone numbers can also be opened, and are
+        flagged with a warning when they don't look like one.
+
+        Parameters
+        ----------
+        display_text : str
+            Text shown.
+        copy_text : str
+            Value copied on click.
+
+        Returns
+        -------
+        QWidget
+            The label of the value.
         """
-        if self.field_name == "websites":
-            widget = WebsiteLabel(display_text, copy_text)
-        elif self.field_name == "emails":
-            widget = EmailLabel(display_text, copy_text)
-        elif self.field_name == "phones":
-            widget = PhoneLabel(display_text, copy_text)
-        else:
+        if self.field_name not in _ACTIONABLE_FIELDS:
             return ClickToCopyLabel(display_text, copy_text)
 
-        if not self._masked and copy_text:
-            if self.field_name == "emails":
-                is_valid = _looks_like_email(copy_text)
-                tooltip_key = "invalid_email_tooltip"
-            elif self.field_name == "phones":
-                is_valid = _looks_like_phone(copy_text)
-                tooltip_key = "invalid_phone_tooltip"
-            else:
-                is_valid = _looks_like_website(copy_text)
-                tooltip_key = "invalid_website_tooltip"
-            if not is_valid:
-                widget.setText(f"⚠ {display_text}")
-                widget.setToolTip(translator.translate(tooltip_key))
-                # Themed via the `ClickToCopyLabel[state="warning"]`
-                # QSS rule. Uses `set_base_state` (not a raw
-                # `setProperty`) so the warning survives a
-                # click-to-copy's transient "flash" state -- see
-                # `ClickToCopyLabel._flash_feedback`.
-                widget.set_base_state("warning")
+        label_cls, pattern, tooltip_key = _ACTIONABLE_FIELDS[self.field_name]
+        widget = label_cls(display_text, copy_text)
+        if copy_text and not pattern.match(copy_text.strip()):
+            widget.setText(f"⚠ {display_text}")
+            widget.setToolTip(translator.translate(tooltip_key))
+            widget.set_base_state("warning")
         return widget
 
-    def _set_view_widgets_visible(self, visible: bool) -> None:
-        for widget in self._view_widgets:
-            widget.setVisible(visible)
-
-    def _refresh_edit(self) -> None:
-        joined = "\n".join(self._clear_lines)
-        if self._use_list_edit:
-            self._clear_entries()
-            for value in self._clear_lines:
-                self._add_entry_row(value)
-        elif self._use_textarea_edit:
-            self.edit_text.blockSignals(True)
-            self.edit_text.setPlainText(joined)
-            self.edit_text.blockSignals(False)
-            self._auto_resize_edit_text()
-        else:
-            self.edit_line.setText(joined)
-
     def _toggle_mask(self) -> None:
+        """Switch the secret values between masked and clear."""
         self._masked = not self._masked
         self._refresh_view()
 
+    # -- EDIT mode ----------------------------------------------------------
+
     def _auto_resize_edit_text(self) -> None:
+        """Fit the multi-line editor's height to its content, within bounds."""
         doc = self.edit_text.document()
         doc.setTextWidth(max(self.edit_text.viewport().width(), 50))
         height = int(doc.size().height()) + 12
         self.edit_text.setFixedHeight(max(34, min(height, 220)))
 
-    # -- Per-value rows (list fields) ---------------------------------------
-
-    def _clear_entries(self) -> None:
-        while self.entries_container.count():
-            item = self.entries_container.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        self._entry_edits.clear()
-
     def _add_entry_row(self, text: str = "") -> None:
-        """Append one editable value row, with its own remove button."""
+        """
+        Append one editable value row, with its own remove button.
+
+        Parameters
+        ----------
+        text : str, optional
+            Initial value of the row.
+        """
         row_widget = QWidget()
         row_layout = QHBoxLayout(row_widget)
         row_layout.setContentsMargins(0, 0, 0, 0)
@@ -688,171 +675,202 @@ class FieldRow(QFrame):
         line_edit = QLineEdit(text)
         row_layout.addWidget(line_edit)
 
-        entry_remove_btn = QPushButton("✕")
-        entry_remove_btn.setObjectName("smallButton")
-        entry_remove_btn.setFixedSize(28, 28)
-        entry_remove_btn.setToolTip(translator.translate("remove_value_tooltip"))
-        entry_remove_btn.clicked.connect(lambda: self._remove_entry_row(row_widget))
-        row_layout.addWidget(entry_remove_btn)
+        remove_btn = self._small_button("✕", "viewer.remove_value_tooltip", square=True)
+        remove_btn.setVisible(True)
+        remove_btn.clicked.connect(lambda: self._remove_entry_row(row_widget, line_edit))
+        row_layout.addWidget(remove_btn)
 
-        row_widget.line_edit = line_edit
-        # IMPORTANT: reparent into the layout *before* touching
-        # visibility. `row_widget` has no parent yet at this point,
-        # so an unparented QWidget is a genuine top-level window --
-        # calling setVisible(True) on it first (as this used to do)
-        # briefly creates and shows a real OS window before addWidget
-        # reparents it into the layout, one flicker per row.
+        # Parent the row before changing its visibility: showing an
+        # unparented widget briefly opens it as a top-level window.
         self.entries_container.addWidget(row_widget)
         row_widget.setVisible(self._edit_mode_active)
         self._entry_edits.append(line_edit)
 
-    def _open_generator(self) -> None:
-        """Open :class:`GeneratorDialog` and, if accepted, add the result as a new value row."""
-        dialog = GeneratorDialog(parent=self)
-        if dialog.exec_() != QDialog.Accepted:
-            return
-        self._add_entry_row(dialog.get_password())
+    def _remove_entry_row(self, row_widget: QWidget, line_edit: QLineEdit) -> None:
+        """
+        Remove one value row.
 
-    def _remove_entry_row(self, row_widget: QWidget) -> None:
-        """Remove a single value row (does not touch the others)."""
-        if row_widget.line_edit in self._entry_edits:
-            self._entry_edits.remove(row_widget.line_edit)
+        Parameters
+        ----------
+        row_widget : QWidget
+            The row to remove.
+        line_edit : QLineEdit
+            The row's input.
+        """
+        if line_edit in self._entry_edits:
+            self._entry_edits.remove(line_edit)
         self.entries_container.removeWidget(row_widget)
         row_widget.deleteLater()
 
-    # -- Mode --------------------------------------------------------------
+    def _open_generator(self) -> None:
+        """Open the password generator and add its result as a new value row."""
+        dialog = GeneratorDialog(parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            self._add_entry_row(dialog.get_password())
 
     def set_edit_mode(self, editable: bool) -> None:
-        """Switches the row between read-only display and editing."""
-        self._edit_mode_active = editable
-        self._set_view_widgets_visible(not editable)
-        self.eye_btn.setVisible((not editable) and self.is_secret)
-        self.remove_btn.setVisible(editable and self.is_custom)
+        """
+        Switch the row between VIEW and EDIT mode.
 
-        if self._use_list_edit:
-            self.edit_line.setVisible(False)
-            self.edit_text.setVisible(False)
-            for i in range(self.entries_container.count()):
-                widget = self.entries_container.itemAt(i).widget()
-                if widget is not None:
-                    widget.setVisible(editable)
-            self.add_entry_btn.setVisible(editable)
-            self.generate_btn.setVisible(editable and self.is_password)
-        elif self._use_textarea_edit:
-            self.edit_line.setVisible(False)
-            self.edit_text.setVisible(editable)
-            self.add_entry_btn.setVisible(False)
-            self.generate_btn.setVisible(False)
-            if editable:
-                self._auto_resize_edit_text()
-        else:
-            self.edit_text.setVisible(False)
-            self.edit_line.setVisible(editable)
-            self.add_entry_btn.setVisible(False)
-            self.generate_btn.setVisible(False)
+        Parameters
+        ----------
+        editable : bool
+            ``True`` for EDIT mode, ``False`` for VIEW mode.
+        """
+        self._edit_mode_active = editable
+        for widget in self._view_widgets:
+            widget.setVisible(not editable)
+        self.eye_btn.setVisible(self.is_secret and not editable)
+        self.remove_btn.setVisible(self.is_custom and editable)
+
+        use_line_edit = not self._use_list_edit and not self._use_textarea_edit
+        self.edit_line.setVisible(editable and use_line_edit)
+        self.edit_text.setVisible(editable and self._use_textarea_edit)
+        if editable and self._use_textarea_edit:
+            self._auto_resize_edit_text()
+
+        for i in range(self.entries_container.count()):
+            widget = self.entries_container.itemAt(i).widget()
+            if widget is not None:
+                widget.setVisible(editable)
+        self.add_entry_btn.setVisible(editable and self._use_list_edit)
+        self.generate_btn.setVisible(editable and self._use_list_edit and self.is_password)
 
 
 class TotpFieldRow(FieldRow):
     """
-    Specialized row for TOTP codes.
+    Row of the TOTP secrets.
 
-    In VIEW mode, shows for each secret the current 6-digit code and
-    the time remaining before renewal, recomputed every second. The
-    raw secret is never shown in clear text in VIEW mode. In EDIT
-    mode, behaves like a regular list of secret fields: the Base32
-    secret(s) are shown in clear text and editable, each as its own
-    row that can be added or removed.
+    In VIEW mode, each secret is shown as its current code and the
+    seconds left before renewal, refreshed every second; clicking
+    copies the code, never the secret. In EDIT mode, the Base32
+    secrets are edited in clear as a regular list field.
+
+    Parameters
+    ----------
+    field_name : str
+        Field name, ``"totps"``.
+    label_text : str
+        Label shown above the codes.
+    parent : QWidget, optional
+        Parent widget.
     """
 
     def __init__(self, field_name: str, label_text: str, parent=None):
-        super().__init__(
-            field_name, label_text, is_list=True, is_secret=True, parent=parent
-        )
+        # Not `is_secret`: secrets are never shown in VIEW mode, so
+        # there is nothing to mask or unmask.
+        super().__init__(field_name, label_text, is_list=True, parent=parent)
         self._timer = QTimer(self)
-        self._timer.setInterval(1000)
+        self._timer.setInterval(_TOTP_REFRESH_MS)
         self._timer.timeout.connect(self._refresh_view)
         self._timer.start()
 
-    def _display_lines(self) -> list[str]:
-        if not self._clear_lines:
-            return []
-        lines = []
+    def _view_entries(self) -> list[tuple[str, str]]:
+        """
+        Return the current codes to show in VIEW mode.
+
+        Returns
+        -------
+        list of (str, str)
+            ``(display_text, code)`` per secret; an invalid secret
+            shows an error and copies nothing.
+        """
+        entries = []
         for secret in self._clear_lines:
             try:
                 code, remaining = generate_totp_code(bytearray(secret, "utf-8"))
-                lines.append(f"{code}   ({remaining}s)")
             except ValueError:
-                lines.append(translator.translate("invalid_totp_secret"))
-        return lines
+                entries.append((translator.translate("viewer.invalid_totp_secret"), ""))
+            else:
+                entries.append((f"{code}   ({remaining}s)", code))
+        return entries
 
     def _refresh_view(self) -> None:
-        # Only meaningful while the row is actually in VIEW mode;
-        # no need to recompute/rebuild otherwise (widgets hidden in
-        # EDIT mode).
-        if not self._edit_mode_active:
-            self._clear_view_widgets()
-            lines = self._display_lines()
+        """
+        Refresh the codes, in VIEW mode only.
 
-            if not lines:
-                self.view_container.addWidget(self._make_empty_placeholder())
-            else:
-                for line in lines:
-                    # Copy the current *code*, never the raw secret.
-                    invalid = translator.translate("invalid_totp_secret")
-                    code = line.split()[0] if line != invalid else ""
-                    widget = ClickToCopyLabel(line, code)
-                    self.view_container.addWidget(widget)
-                    self._view_widgets.append(widget)
-
-        self.eye_btn.setVisible(False)
-
-    def set_edit_mode(self, editable: bool) -> None:
-        super().set_edit_mode(editable)
-        # Never show a mask-toggle button for a TOTP: the raw secret
-        # is only ever exposed while editing, never unmasked in
-        # read-only mode.
-        self.eye_btn.setVisible(False)
+        Existing labels are updated in place rather than rebuilt, so a
+        click's flash feedback isn't cut short by the next tick.
+        """
+        if self._edit_mode_active:
+            return
+        entries = self._view_entries()
+        labels = [w for w in self._view_widgets if isinstance(w, ClickToCopyLabel)]
+        if entries and len(labels) == len(self._view_widgets) == len(entries):
+            for label, (display_text, code) in zip(labels, entries):
+                label.setText(display_text)
+                label.set_copy_text(code)
+        else:
+            super()._refresh_view()
 
 
 class IconPreview(QLabel):
     """
-    Preview of the item's icon, shown at the top of the viewer.
+    Preview of the item's icon, shown in the viewer's header.
 
-    Falls back to the package's bundled default icon
-    (``resources/item_icons/_default.png``) when the item has no icon
-    path, or the path is unreadable. When made editable (EDIT mode),
-    a double click emits :attr:`edit_requested` instead of doing
-    nothing.
+    Shows the bundled default icon when the item has no readable icon.
+    While editable, a double click emits :attr:`edit_requested`.
+
+    Parameters
+    ----------
+    parent : QWidget, optional
+        Parent widget.
+
+    Attributes
+    ----------
+    edit_requested : pyqtSignal()
+        Emitted on a double click while editable.
     """
 
     edit_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(56, 56)
+        self.setFixedSize(_ICON_PREVIEW_SIZE_PX, _ICON_PREVIEW_SIZE_PX)
         self.setScaledContents(True)
-        # Border/background come from the `IconPreview { ... }` rule
-        # in theme.py, matched by this class's name.
         self.setVisible(False)
         self._editable = False
 
     def set_path(self, path: str | None) -> None:
-        pixmap = _icon_pixmap_or_default(path)
-        if pixmap is None:
-            # Only reached if even the bundled default icon is missing.
-            self.setVisible(False)
+        """
+        Show the icon of a stored icon value.
+
+        Parameters
+        ----------
+        path : str or None
+            Bare bundled filename, path to an image, or ``None``. The
+            preview is hidden if even the default icon is missing.
+        """
+        icon = _item_icon_or_default(path)
+        if icon is None:
             self.clear()
-        else:
-            self.setPixmap(pixmap)
-            self.setVisible(True)
+            self.setVisible(False)
+            return
+        self.setPixmap(icon.pixmap(_ICON_PREVIEW_SIZE_PX, _ICON_PREVIEW_SIZE_PX))
+        self.setVisible(True)
 
     def set_editable(self, editable: bool) -> None:
-        """Enables or disables double-click-to-edit."""
+        """
+        Enable or disable double-click-to-edit.
+
+        Parameters
+        ----------
+        editable : bool
+            Whether a double click emits :attr:`edit_requested`.
+        """
         self._editable = editable
         self.setCursor(Qt.PointingHandCursor if editable else Qt.ArrowCursor)
-        self.setToolTip(translator.translate("icon_edit_tooltip") if editable else "")
+        self.setToolTip(translator.translate("viewer.icon_edit_tooltip") if editable else "")
 
-    def mouseDoubleClickEvent(self, event):
+    def mouseDoubleClickEvent(self, event) -> None:
+        """
+        Emit :attr:`edit_requested` on a left double click, if editable.
+
+        Parameters
+        ----------
+        event : QMouseEvent
+            The double-click event.
+        """
         if self._editable and event.button() == Qt.LeftButton:
             self.edit_requested.emit()
             return
@@ -860,189 +878,56 @@ class IconPreview(QLabel):
 
 
 # ---------------------------------------------------------------------------
-# Dialogs
+# Item viewer
 # ---------------------------------------------------------------------------
-
-
-class IconEditDialog(QDialog):
-    """
-    Small dialog to change an item's icon, by typing a path directly
-    or browsing for a file (defaulting to the bundled
-    ``resources/item_icons`` directory).
-    """
-
-    def __init__(self, current_path: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(translator.translate("icon_dialog_title"))
-        self.setModal(True)
-
-        layout = QVBoxLayout(self)
-
-        row = QHBoxLayout()
-        self.path_edit = QLineEdit(current_path or "")
-        self.path_edit.setPlaceholderText(translator.translate("icon_path_placeholder"))
-        row.addWidget(self.path_edit)
-
-        browse_btn = QPushButton(translator.translate("browse_button"))
-        browse_btn.setObjectName("smallButton")
-        browse_btn.clicked.connect(self._browse)
-        row.addWidget(browse_btn)
-        layout.addLayout(row)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _browse(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            translator.translate("select_icon_dialog_title"),
-            _icons_directory(),
-            f"{translator.translate('image_files_filter')};;{translator.translate('all_files_filter')}",
-        )
-        if filename:
-            self.path_edit.setText(self._shorten_if_bundled(filename))
-
-    @staticmethod
-    def _shorten_if_bundled(filename: str) -> str:
-        """
-        Reduce ``filename`` to a bare filename (e.g. ``"github.png"``)
-        when it sits directly inside the bundled ``resources/item_icons``
-        directory -- the folder :meth:`_browse`'s dialog opens in by
-        default -- so a selection made there is stored the same way
-        as an icon referenced by name elsewhere (see
-        :func:`_resolve_icon_path`), rather than as an absolute path
-        tied to this particular machine's install location.
-
-        Parameters
-        ----------
-        filename : str
-            The absolute path returned by the file picker.
-
-        Returns
-        -------
-        str
-            ``os.path.basename(filename)`` if it lives directly in
-            the bundled icons directory, otherwise ``filename``
-            unchanged (e.g. a user-picked icon that lives elsewhere
-            on disk keeps its full, absolute path).
-        """
-        icons_dir = _icons_directory()
-        if not icons_dir:
-            return filename
-        try:
-            same_dir = os.path.samefile(os.path.dirname(filename), icons_dir)
-        except OSError:
-            # e.g. the bundled directory or the selected file's
-            # parent doesn't exist / isn't resolvable on this
-            # install -- treat as "not the bundled directory".
-            same_dir = False
-        if same_dir:
-            return os.path.basename(filename)
-        return filename
-
-    def get_path(self) -> str:
-        """Returns the entered path, stripped of leading/trailing spaces."""
-        return self.path_edit.text().strip()
-
-
-class CustomFieldDialog(QDialog):
-    """
-    Dialog to create a new custom field.
-
-    Only the ``SCALAR`` (clear-text) and ``ENCRYPTED`` (secret) kinds
-    are offered: multi-value custom fields are not supported by this
-    interface.
-    """
-
-    def __init__(self, existing_names: tuple[str, ...] = (), parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(translator.translate("custom_field_dialog_title"))
-        self.setModal(True)
-        self._existing_names = existing_names
-
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-
-        self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText(
-            translator.translate("field_name_placeholder")
-        )
-        form.addRow(translator.translate("name_label"), self.name_edit)
-
-        self.kind_combo = QComboBox()
-        self.kind_combo.addItems(["SCALAR", "ENCRYPTED"])
-        form.addRow(translator.translate("type_label"), self.kind_combo)
-
-        layout.addLayout(form)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _on_accept(self) -> None:
-        name = self.name_edit.text().strip()
-        if not name:
-            QMessageBox.warning(
-                self,
-                translator.translate("error_title"),
-                translator.translate("field_name_required"),
-            )
-            return
-        if name in self._existing_names:
-            QMessageBox.warning(
-                self,
-                translator.translate("error_title"),
-                translator.translate("field_already_exists", name=name),
-            )
-            return
-        self.accept()
-
-    def get_data(self) -> dict:
-        """Returns ``{'name': str, 'kind': "SCALAR" | "ENCRYPTED"}``."""
-        return {
-            "name": self.name_edit.text().strip(),
-            "kind": self.kind_combo.currentText(),
-        }
-
-
-# ---------------------------------------------------------------------------
-# Main widget
-# ---------------------------------------------------------------------------
-
-#: Fixed height shared by the bottom-row action buttons, so equivalent
-#: buttons (Save, Cancel, + Custom field) always line up.
-_ACTION_BUTTON_HEIGHT = 32
 
 
 class ItemViewer(QWidget):
     """
-    Main widget to display and edit an :class:`Item`.
+    Widget showing and editing an :class:`Item`.
 
-    Two modes:
+    - **VIEW** mode: only non-empty fields are shown, every value is
+      copied on click, secrets are masked by default and TOTP codes
+      are shown with their countdown. Websites, emails and phone
+      numbers open on double click.
+    - **EDIT** mode: every field is shown, in clear and editable. List
+      fields can gain or lose values, custom fields can be added or
+      removed, and "Save" writes the changes into the item.
 
-    - **VIEW** (read-only): only non-empty fields are shown, every
-      value is copyable on click, secrets are masked by default (a
-      "Show" button reveals them), TOTP codes are shown in clear text
-      along with their countdown timer. Websites, emails and phone
-      numbers can also be opened with a double click.
-    - **EDIT**: all fields are shown (including ``None`` ones,
-      displayed empty), all values are in clear text and editable.
-      List fields (logins, passwords, phones, emails, websites,
-      TOTP secrets) can have individual values added or removed, not
-      just those already present. Custom fields can be added or
-      removed too. A "Save" button pushes the changes to the
-      :class:`Item`.
+    The item's name and icon are shown in the header; the name is
+    edited in place, the icon through :class:`ItemIconDialog` on a
+    double click.
 
-    The item's name is shown as a title above the field list, next to
-    its icon; both stay editable while in EDIT mode. The icon itself
-    is changed through a double click (see :class:`IconEditDialog`)
-    rather than through a field row.
+    Parameters
+    ----------
+    manager : PasswordManager
+        Manager holding the credentials used to decrypt and encrypt
+        the item's secrets.
+    item : Item
+        Item to show and edit.
+    parent : QWidget, optional
+        Parent widget.
+
+    Attributes
+    ----------
+    close_requested : pyqtSignal()
+        Emitted when "Close" is clicked; the owner decides what to do.
+    item_changed : pyqtSignal()
+        Emitted whenever a change is written into the item (save, icon,
+        custom field added or removed), so the owner can refresh its
+        lists and mark the manager as modified.
+
+    Notes
+    -----
+    Custom field additions/removals and icon changes are applied to
+    the item right away; only the name and the field values wait for
+    "Save", and are the only changes "Cancel" discards.
     """
 
-    def __init__(self, manager: "PasswordManager", item: "Item", parent=None):
+    close_requested = pyqtSignal()
+    item_changed = pyqtSignal()
+
+    def __init__(self, manager: PasswordManager, item: Item, parent=None):
         super().__init__(parent)
         self.manager = manager
         self.item = item
@@ -1050,11 +935,62 @@ class ItemViewer(QWidget):
         self._field_rows: dict[str, FieldRow] = {}
 
         self._init_ui()
-        self._refresh_display()
+        self.retranslate()
+        translator.language_changed.connect(self.retranslate)
 
-    # -- UI construction ---------------------------------------------------
+    # -- Public API ---------------------------------------------------------
+
+    @property
+    def is_editing(self) -> bool:
+        """
+        Tell whether the viewer is in EDIT mode.
+
+        Returns
+        -------
+        bool
+            ``True`` in EDIT mode, ``False`` in VIEW mode.
+        """
+        return self._edit_mode
+
+    @pyqtSlot()
+    def retranslate(self) -> None:
+        """Refresh every text after a language change, keeping unsaved edits."""
+        self.edit_btn.setText(translator.translate("viewer.edit"))
+        self.close_btn.setText(translator.translate("common.close"))
+        self.add_custom_btn.setText(translator.translate("viewer.add_custom_field_button"))
+        self.cancel_btn.setText(translator.translate("common.cancel"))
+        self.save_btn.setText(translator.translate("common.save"))
+        self.title_edit.setPlaceholderText(translator.translate("viewer.item_name_placeholder"))
+        self.refresh()
+
+    def confirm_close(self) -> bool:
+        """
+        Ask what to do with unsaved edits before the viewer is closed.
+
+        Returns
+        -------
+        bool
+            ``True`` if the viewer may close: VIEW mode, or the edits
+            were saved or discarded. ``False`` if the user cancelled.
+        """
+        if not self._edit_mode:
+            return True
+        reply = QMessageBox.question(
+            self,
+            translator.translate("common.confirmation_title"),
+            translator.translate("viewer.unsaved_changes_warning"),
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+        )
+        if reply == QMessageBox.Cancel:
+            return False
+        if reply == QMessageBox.Save:
+            self.save()
+        return True
+
+    # -- UI -----------------------------------------------------------------
 
     def _init_ui(self) -> None:
+        """Build the toolbar, the header, the field list and the action bar."""
         layout = QVBoxLayout(self)
         layout.setSpacing(0)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1064,55 +1000,42 @@ class ItemViewer(QWidget):
         toolbar.setIconSize(QSize(24, 24))
         layout.addWidget(toolbar)
 
-        self.edit_btn = QPushButton(translator.translate("edit_button"))
-        self.edit_btn.clicked.connect(self._enter_edit_mode)
-        # `QToolBar.addWidget` wraps the widget in an internal
-        # `QWidgetAction`: the toolbar's layout consults *that
-        # action's* visibility to decide whether to show/collapse the
-        # slot, not the widget's own `isVisible()`. Toggling only
-        # `self.edit_btn.setVisible(...)` (as for `cancel_btn`/
-        # `save_btn`, which sit in a plain QHBoxLayout and don't have
-        # this problem) can therefore leave the button visibly stuck
-        # in the toolbar even after being hidden -- toggling the
-        # returned action instead (see `_refresh_display`) is what
-        # actually makes the toolbar hide/reclaim its slot.
-        self.edit_btn_action = toolbar.addWidget(self.edit_btn)
+        self.edit_btn = self._action_button("viewer.edit", self.enter_edit_mode)
+        self.edit_btn.setObjectName("editButton")
+        self.edit_btn.setVisible(True)
+        toolbar.addWidget(self.edit_btn)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         toolbar.addWidget(spacer)
+
+        self.close_btn = self._action_button("common.close", self.close_requested.emit)
+        self.close_btn.setVisible(True)
+        toolbar.addWidget(self.close_btn)
 
         header = QHBoxLayout()
         header.setContentsMargins(8, 8, 8, 8)
 
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
-
         self.title_edit = QLineEdit()
         self.title_edit.setObjectName("itemTitleEdit")
-        self.title_edit.setPlaceholderText(
-            translator.translate("item_name_placeholder")
-        )
+        self.title_edit.setPlaceholderText(translator.translate("viewer.item_name_placeholder"))
         self.title_edit.setFrame(False)
         title_box.addWidget(self.title_edit)
 
         self.date_label = QLabel()
         self.date_label.setObjectName("mutedLabel")
         title_box.addWidget(self.date_label)
-
         header.addLayout(title_box, stretch=1)
 
         self.icon_preview = IconPreview()
         self.icon_preview.edit_requested.connect(self._edit_icon)
         header.addWidget(self.icon_preview, alignment=Qt.AlignTop)
-
         layout.addLayout(header)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-
         self.content_widget = QWidget()
         self.content_layout = QVBoxLayout(self.content_widget)
         self.content_layout.setAlignment(Qt.AlignTop)
@@ -1124,395 +1047,327 @@ class ItemViewer(QWidget):
         bottom.setContentsMargins(8, 6, 8, 6)
         bottom.setSpacing(8)
 
-        self.add_custom_btn = QPushButton(
-            translator.translate("add_custom_field_button")
+        self.add_custom_btn = self._action_button(
+            "viewer.add_custom_field_button", self._add_custom_field
         )
-        self.add_custom_btn.setFixedHeight(_ACTION_BUTTON_HEIGHT)
-        self.add_custom_btn.setVisible(False)
-        self.add_custom_btn.clicked.connect(self._add_custom_field)
         bottom.addWidget(self.add_custom_btn)
-
         bottom.addStretch()
 
-        self.cancel_btn = QPushButton(translator.translate("cancel_button"))
+        self.cancel_btn = self._action_button("common.cancel", self._cancel_changes)
         self.cancel_btn.setObjectName("dangerButton")
-        self.cancel_btn.setFixedHeight(_ACTION_BUTTON_HEIGHT)
-        self.cancel_btn.setVisible(False)
-        self.cancel_btn.clicked.connect(self._cancel_changes)
         bottom.addWidget(self.cancel_btn)
 
-        self.save_btn = QPushButton(translator.translate("save_button"))
-        self.save_btn.setFixedHeight(_ACTION_BUTTON_HEIGHT)
-        self.save_btn.setVisible(False)
-        self.save_btn.clicked.connect(self._save_changes)
+        self.save_btn = self._action_button("common.save", self.save)
         bottom.addWidget(self.save_btn)
-
         layout.addLayout(bottom)
 
-    # -- Data ----------------------------------------------------------------
-
-    def _get_credentials(self) -> Credentials:
-        # `Item.get`/`Item.set` take the whole `Credentials` instance
-        # rather than a separate password/iterations pair -- this is
-        # exactly the shared object the manager itself encrypts and
-        # decrypts with (see `PasswordManager.get_credentials`).
-        return self.manager.get_credentials()
-
     @staticmethod
-    def _to_clear_lines(value, is_secret: bool) -> list[str]:
+    def _action_button(text_key: str, slot: Callable[[], None]) -> QPushButton:
         """
-        Normalizes a value returned by :class:`Item` (scalar, list,
-        ``str`` or ``bytearray``) into a list of clear-text strings.
+        Build a hidden action button of the shared height.
+
+        Parameters
+        ----------
+        text_key : str
+            Translation key of the button text.
+        slot : callable
+            Called when the button is clicked.
+
+        Returns
+        -------
+        QPushButton
+            The new, hidden button.
         """
-        if value is None:
-            return []
-        items = value if isinstance(value, list) else [value]
-        lines: list[str] = []
-        for v in items:
-            if isinstance(v, (bytes, bytearray)):
-                lines.append(bytes(v).decode("utf-8"))
-            else:
-                lines.append(str(v))
-        return lines
+        button = QPushButton(translator.translate(text_key))
+        button.setFixedHeight(_ACTION_BUTTON_HEIGHT)
+        button.setVisible(False)
+        button.clicked.connect(slot)
+        return button
 
-    def _add_error_row(self, label: str, exc: Exception) -> None:
-        err = QLabel(translator.translate("field_error_row", label=label, error=exc))
-        err.setWordWrap(True)
-        err.setObjectName("errorLabel")
-        self.content_layout.addWidget(err)
-
-    def _clear_content(self) -> None:
-        while self.content_layout.count():
-            item = self.content_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        self._field_rows.clear()
-
-    # -- Display ---------------------------------------------------------------
-
-    def _add_standard_row(
-        self,
-        field: str,
-        label: str,
-        *,
-        is_list: bool,
-        is_secret: bool,
-        credentials: Credentials,
-    ) -> None:
-        """Build and append one standard :class:`FieldRow`, if it should be shown."""
-        try:
-            value = self.item.get(field, credentials=credentials if is_secret else None)
-        except Exception as exc:
-            self._add_error_row(label, exc)
-            return
-
-        clear_lines = self._to_clear_lines(value, is_secret)
-        if not self._edit_mode and not clear_lines:
-            return
-
-        row = FieldRow(
-            field,
-            label,
-            is_list=is_list,
-            is_secret=is_secret,
-            is_password=(field == "passwords"),
-        )
-        row.set_value(clear_lines)
-        row.set_edit_mode(self._edit_mode)
-        self.content_layout.addWidget(row)
-        self._field_rows[field] = row
-
-    def _add_totp_row(self, credentials: Credentials) -> None:
-        """Build and append the :class:`TotpFieldRow`, if it should be shown."""
-        label = translator.translate("field_totps")
-        try:
-            totp_value = self.item.get("totps", credentials=credentials)
-        except Exception as exc:
-            self._add_error_row(label, exc)
-            totp_value = None
-
-        clear_totps = self._to_clear_lines(totp_value, True)
-        if not self._edit_mode and not clear_totps:
-            return
-
-        row = TotpFieldRow("totps", label)
-        row.set_value(clear_totps)
-        row.set_edit_mode(self._edit_mode)
-        self.content_layout.addWidget(row)
-        self._field_rows["totps"] = row
+    # -- Display ------------------------------------------------------------
 
     def _refresh_display(self) -> None:
-        self._clear_content()
-        credentials = self._get_credentials()
+        """Rebuild the header and every field row from the item, in the current mode."""
+        _clear_layout(self.content_layout)
+        self._field_rows.clear()
+        credentials = self.manager.get_credentials()
 
         self.title_edit.setText(self.item.get("item_name") or "")
         self.title_edit.setReadOnly(not self._edit_mode)
 
         raw_date = self.item.get("item_date")
         self.date_label.setText(
-            translator.translate("last_modified", date=raw_date) if raw_date else ""
+            translator.translate("viewer.last_modified", date=raw_date) if raw_date else ""
         )
 
         self.icon_preview.set_path(self.item.get("icon"))
         self.icon_preview.set_editable(self._edit_mode)
 
-        self._add_standard_row(
-            "logins",
-            translator.translate("field_logins"),
-            is_list=True,
-            is_secret=False,
-            credentials=credentials,
-        )
-        self._add_standard_row(
-            "passwords",
-            translator.translate("field_passwords"),
-            is_list=True,
-            is_secret=True,
-            credentials=credentials,
-        )
-        self._add_totp_row(credentials)
-        self._add_standard_row(
-            "websites",
-            translator.translate("field_websites"),
-            is_list=True,
-            is_secret=False,
-            credentials=credentials,
-        )
-        self._add_standard_row(
-            "emails",
-            translator.translate("field_emails"),
-            is_list=True,
-            is_secret=False,
-            credentials=credentials,
-        )
-        self._add_standard_row(
-            "phones",
-            translator.translate("field_phones"),
-            is_list=True,
-            is_secret=False,
-            credentials=credentials,
-        )
+        for field, label_key, is_secret in _STANDARD_FIELDS:
+            self._add_standard_row(field, translator.translate(label_key), is_secret, credentials)
+        self._add_custom_rows(credentials)
 
-        custom_names = self.item.custom_fields()
-        if custom_names or self._edit_mode:
-            if custom_names:
-                separator = QFrame()
-                separator.setFrameShape(QFrame.HLine)
-                separator.setFrameShadow(QFrame.Sunken)
-                self.content_layout.addWidget(separator)
-
-                title = QLabel(translator.translate("custom_fields_section"))
-                # Reuses the same "sectionTitle" QSS rule as e.g. the
-                # "Vaults" title in `manager_gui.py`, rather than an
-                # explicit `setFont(...)`: an explicitly-set font
-                # detaches a widget from the application's font, so it
-                # would stop following the interface zoom the moment
-                # `_apply_zoom` next changes it -- staying on the
-                # inherited/QSS-driven font (whose `theme.py` rule is
-                # itself kept in step with the zoom's `text_scale`) is
-                # what keeps this title in sync going forward, not
-                # just at the instant it was created.
-                title.setObjectName("sectionTitle")
-                title.setContentsMargins(0, 6, 0, 6)
-                self.content_layout.addWidget(title)
-
-            custom_store = self.item.to_dict().get("custom") or {}
-            for name in custom_names:
-                kindstr = custom_store[name][0]
-                is_secret = kindstr == "ENCRYPTED"
-                try:
-                    value = self.item.get_custom(
-                        name,
-                        credentials=credentials if is_secret else None,
-                    )
-                except Exception as exc:
-                    self._add_error_row(name, exc)
-                    continue
-
-                clear_lines = self._to_clear_lines(value, is_secret)
-                if not self._edit_mode and not clear_lines:
-                    continue
-
-                field_key = f"custom:{name}"
-                row = FieldRow(
-                    field_key, name, is_list=False, is_secret=is_secret, is_custom=True
-                )
-                row.set_value(clear_lines)
-                row.set_edit_mode(self._edit_mode)
-                row.remove_requested.connect(self._remove_custom_field)
-                self.content_layout.addWidget(row)
-                self._field_rows[field_key] = row
-
-        self.edit_btn_action.setVisible(not self._edit_mode)
+        self.edit_btn.setEnabled(not self._edit_mode)
         self.add_custom_btn.setVisible(self._edit_mode)
         self.cancel_btn.setVisible(self._edit_mode)
         self.save_btn.setVisible(self._edit_mode)
 
-    def _refresh_display_preserving_edits(self) -> None:
+    def _add_standard_row(
+        self,
+        field: str,
+        label: str,
+        is_secret: bool,
+        credentials: Credentials,
+    ) -> None:
         """
-        Like :meth:`_refresh_display`, but preserves whatever is
-        currently sitting -- typed but not yet saved -- in the item
-        name box and every field's EDIT-mode widgets, across the
-        rebuild.
- 
+        Append the row of a standard field, if it should be shown.
+
+        Parameters
+        ----------
+        field : str
+            Standard field name.
+        label : str
+            Translated label of the field.
+        is_secret : bool
+            Whether the field is encrypted.
+        credentials : Credentials
+            Credentials decrypting the field, if encrypted.
+        """
+        try:
+            value = self.item.get(field, credentials=credentials if is_secret else None)
+        except Exception as exc:
+            self._add_error_row(label, exc)
+            return
+
+        clear_lines = _to_clear_lines(value)
+        if not self._should_show(clear_lines):
+            return
+        if field == "totps":
+            row = TotpFieldRow(field, label)
+        else:
+            row = FieldRow(
+                field,
+                label,
+                is_list=True,
+                is_secret=is_secret,
+                is_password=(field == "passwords"),
+            )
+        self._add_row(field, row, clear_lines)
+
+    def _add_custom_rows(self, credentials: Credentials) -> None:
+        """
+        Append the custom fields section, if it has rows to show.
+
+        Parameters
+        ----------
+        credentials : Credentials
+            Credentials decrypting the encrypted custom fields.
+        """
+        custom_names = self.item.custom_fields()
+        if not custom_names:
+            return
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        self.content_layout.addWidget(separator)
+
+        # QSS-driven font (not `setFont`), so the title follows the zoom.
+        title = QLabel(translator.translate("custom_field.custom_fields_section"))
+        title.setObjectName("sectionTitle")
+        title.setContentsMargins(0, 6, 0, 6)
+        self.content_layout.addWidget(title)
+
+        custom_store = self.item.to_dict().get("custom") or {}
+        for name in custom_names:
+            is_secret = custom_store[name][0] == "ENCRYPTED"
+            try:
+                value = self.item.get_custom(name, credentials=credentials if is_secret else None)
+            except Exception as exc:
+                self._add_error_row(name, exc)
+                continue
+
+            clear_lines = _to_clear_lines(value)
+            if not self._should_show(clear_lines):
+                continue
+            field_key = f"{_CUSTOM_PREFIX}{name}"
+            row = FieldRow(field_key, name, is_secret=is_secret, is_custom=True)
+            row.remove_requested.connect(self._remove_custom_field)
+            self._add_row(field_key, row, clear_lines)
+
+    def _should_show(self, clear_lines: list[str]) -> bool:
+        """
+        Tell whether a field gets a row in the current mode.
+
+        Parameters
+        ----------
+        clear_lines : list of str
+            Clear-text value(s) of the field.
+
+        Returns
+        -------
+        bool
+            ``True`` in EDIT mode, or if the field has a value.
+        """
+        return self._edit_mode or bool(clear_lines)
+
+    def _add_row(self, key: str, row: FieldRow, clear_lines: list[str]) -> None:
+        """
+        Fill a field row and append it to the field list.
+
+        Parameters
+        ----------
+        key : str
+            Key of the row in :attr:`_field_rows`.
+        row : FieldRow
+            The row to add.
+        clear_lines : list of str
+            Clear-text value(s) of the field.
+        """
+        row.set_value(clear_lines)
+        row.set_edit_mode(self._edit_mode)
+        self.content_layout.addWidget(row)
+        self._field_rows[key] = row
+
+    def _add_error_row(self, label: str, exc: Exception) -> None:
+        """
+        Append an error message in place of a field that couldn't be read.
+
+        Parameters
+        ----------
+        label : str
+            Label of the field.
+        exc : Exception
+            The error raised while reading the field.
+        """
+        error = QLabel(translator.translate("viewer.field_error_row", label=label, error=str(exc)))
+        error.setWordWrap(True)
+        error.setObjectName("errorLabel")
+        self.content_layout.addWidget(error)
+
+    def refresh(self) -> None:
+        """
+        Rebuild the display, keeping the unsaved edits of EDIT mode.
+
         Notes
         -----
-        Adding or removing a custom field (see :meth:`_add_custom_field`/
-        :meth:`_remove_custom_field`) applies right away and is
-        followed by a full :meth:`_refresh_display`, which rebuilds
-        every row from the underlying :class:`Item` -- including the
-        standard fields and the name, whose in-progress edits would
-        otherwise be silently discarded even though the viewer stays
-        in EDIT mode the whole time. A no-op (falls back to a plain
-        :meth:`_refresh_display`) outside EDIT mode, where there is
-        nothing unsaved to preserve.
+        Adding or removing a custom field rebuilds every row from the
+        item, which would otherwise drop the name and values typed but
+        not yet saved.
         """
         if not self._edit_mode:
             self._refresh_display()
             return
- 
+
         name_snapshot = self.title_edit.text()
-        field_snapshot = {
-            field: row.get_edit_values() for field, row in self._field_rows.items()
-        }
- 
+        field_snapshot = {field: row.get_edit_values() for field, row in self._field_rows.items()}
+
         self._refresh_display()
- 
+
         self.title_edit.setText(name_snapshot)
         for field, values in field_snapshot.items():
             row = self._field_rows.get(field)
             if row is not None:
                 row.set_edit_values(values)
 
-    # -- VIEW / EDIT mode --------------------------------------------------
+    # -- Actions ------------------------------------------------------------
 
-    def _enter_edit_mode(self) -> None:
+    def enter_edit_mode(self) -> None:
+        """Switch to EDIT mode."""
         self._edit_mode = True
         self._refresh_display()
 
-    # -- Icon ----------------------------------------------------------------
-
     def _edit_icon(self) -> None:
-        """
-        Open :class:`IconEditDialog` and, if accepted, apply the new
-        icon path right away.
-
-        Unlike the other fields, the icon is not deferred to Save:
-        this mirrors custom field add/remove (see
-        :meth:`_cancel_changes`).
-        """
-        current = self.item.get("icon") or ""
-        dialog = IconEditDialog(current, parent=self)
+        """Pick a new icon through :class:`ItemIconDialog` and apply it right away."""
+        dialog = ItemIconDialog(self.item.get("icon") or "", parent=self)
         if dialog.exec_() != QDialog.Accepted:
             return
-
         new_path = dialog.get_path() or None
         self.item.set("icon", new_path)
         self.icon_preview.set_path(new_path)
+        self.item_changed.emit()
 
-    # -- Saving --------------------------------------------------------------
+    def save(self) -> None:
+        """Write the name and the edited field values into the item, then switch to VIEW mode."""
+        credentials = self.manager.get_credentials()
+        self.item.set("item_name", self.title_edit.text().strip() or None)
 
-    def _save_changes(self) -> None:
-        credentials = self._get_credentials()
-
-        name = self.title_edit.text().strip()
-        self.item.set("item_name", name or None)
-
-        for field, row in list(self._field_rows.items()):
-            if field.startswith("custom:"):
-                continue
-            values = row.get_edit_values()
-
-            if field in ("logins", "websites", "phones", "emails"):
-                # SCALAR_LIST fields in item.py's `_FIELDS` (and
-                # `types.py`'s `ItemData`): stored as clear strings,
-                # no credentials involved.
-                self.item.set(field, values if values else None)
-            else:
-                # Only "passwords" and "totps" are ENCRYPTED_LIST in
-                # item.py's `_FIELDS`, and need bytearray values +
-                # credentials.
-                crypted = [bytearray(v, "utf-8") for v in values if v] or None
-                self.item.set(field, crypted, credentials=credentials)
-
-        custom_store = self.item.to_dict().get("custom") or {}
-        for name in list(self.item.custom_fields()):
-            row = self._field_rows.get(f"custom:{name}")
+        secret_fields = {field for field, _key, is_secret in _STANDARD_FIELDS if is_secret}
+        for field, _label_key, _is_secret in _STANDARD_FIELDS:
+            row = self._field_rows.get(field)
             if row is None:
                 continue
-            kindstr = custom_store[name][0]
+            values = row.get_edit_values()
+            if field in secret_fields:
+                encrypted = [bytearray(v, "utf-8") for v in values] or None
+                self.item.set(field, encrypted, credentials=credentials)
+            else:
+                self.item.set(field, values or None)
+
+        custom_store = self.item.to_dict().get("custom") or {}
+        for name in self.item.custom_fields():
+            row = self._field_rows.get(f"{_CUSTOM_PREFIX}{name}")
+            if row is None:
+                continue
+            kind = custom_store[name][0]
             values = row.get_edit_values()
             raw = values[0] if values else ""
-            if kindstr == "ENCRYPTED":
-                self.item.set_custom(
-                    name,
-                    bytearray(raw, "utf-8"),
-                    kindstr,
-                    credentials=credentials,
-                )
+            if kind == "ENCRYPTED":
+                self.item.set_custom(name, bytearray(raw, "utf-8"), kind, credentials=credentials)
             else:
-                self.item.set_custom(name, raw, kindstr)
+                self.item.set_custom(name, raw, kind)
 
         self._edit_mode = False
         self._refresh_display()
+        self.item_changed.emit()
 
     def _cancel_changes(self) -> None:
-        """
-        Discard in-progress edits and switch back to VIEW mode,
-        without touching the underlying :class:`Item`.
-
-        Note
-        ----
-        Custom fields added or removed via the "+ Custom field" button
-        and its per-field remove button, and the icon changed through
-        :meth:`_edit_icon`, are applied to the item right away (not
-        deferred to Save), so Cancel does not undo those -- only the
-        name and field-row value edits.
-        """
+        """Discard the unsaved edits and switch back to VIEW mode."""
         self._edit_mode = False
         self._refresh_display()
 
-    # -- Custom fields ---------------------------------------------------------
-
     def _add_custom_field(self) -> None:
-        dialog = CustomFieldDialog(
-            existing_names=self.item.custom_fields(), parent=self
-        )
+        """Create a custom field through :class:`CustomFieldDialog`, applied right away."""
+        dialog = CustomFieldDialog(existing_names=self.item.custom_fields(), parent=self)
         if dialog.exec_() != QDialog.Accepted:
             return
 
         data = dialog.get_data()
-        credentials = self._get_credentials()
-
         try:
             if data["kind"] == "ENCRYPTED":
                 self.item.set_custom(
                     data["name"],
-                    bytearray("", "utf-8"),
+                    bytearray(),
                     data["kind"],
-                    credentials=credentials,
+                    credentials=self.manager.get_credentials(),
                 )
             else:
                 self.item.set_custom(data["name"], "", data["kind"])
         except Exception as exc:
             QMessageBox.critical(
                 self,
-                translator.translate("error_title"),
-                translator.translate("add_field_error", error=exc),
+                translator.translate("common.error_title"),
+                translator.translate("viewer.add_field_error", error=str(exc)),
             )
             return
 
-        self._refresh_display_preserving_edits()
+        self.refresh()
+        self.item_changed.emit()
 
     def _remove_custom_field(self, field_key: str) -> None:
-        name = (
-            field_key.split(":", 1)[1] if field_key.startswith("custom:") else field_key
-        )
+        """
+        Remove a custom field after confirmation, applied right away.
+
+        Parameters
+        ----------
+        field_key : str
+            Key of the field's row, ``"custom:<name>"``.
+        """
+        name = field_key.removeprefix(_CUSTOM_PREFIX)
         reply = QMessageBox.question(
             self,
-            translator.translate("remove_field_title"),
-            translator.translate("remove_field_prompt", name=name),
+            translator.translate("viewer.remove_field_title"),
+            translator.translate("viewer.remove_field_prompt", name=name),
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
@@ -1523,26 +1378,24 @@ class ItemViewer(QWidget):
         except Exception as exc:
             QMessageBox.critical(
                 self,
-                translator.translate("error_title"),
-                translator.translate("remove_field_error", error=exc),
+                translator.translate("common.error_title"),
+                translator.translate("viewer.remove_field_error", error=str(exc)),
             )
             return
 
-        self._refresh_display_preserving_edits()
-
-    # -- Closing -----------------------------------------------------------
+        self.refresh()
+        self.item_changed.emit()
 
     def closeEvent(self, event) -> None:
-        if self._edit_mode:
-            reply = QMessageBox.question(
-                self,
-                translator.translate("confirmation_title"),
-                translator.translate("unsaved_changes_warning"),
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-            )
-            if reply == QMessageBox.Save:
-                self._save_changes()
-            elif reply == QMessageBox.Cancel:
-                event.ignore()
-                return
+        """
+        Offer to save or discard unsaved edits before closing.
+
+        Parameters
+        ----------
+        event : QCloseEvent
+            The close event, ignored if the user cancels.
+        """
+        if not self.confirm_close():
+            event.ignore()
+            return
         super().closeEvent(event)

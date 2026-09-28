@@ -1,0 +1,221 @@
+<html>
+<body>
+
+<h1>bippass — Aide</h1>
+
+<p>
+<a href="#concepts">Principes</a> ·
+<a href="#launch">Écran de démarrage</a> ·
+<a href="#window">Fenêtre principale</a> ·
+<a href="#toolbar">Barre d'outils</a> ·
+<a href="#vaults">Coffres</a> ·
+<a href="#items">Éléments</a> ·
+<a href="#viewer">Affichage d'un élément</a> ·
+<a href="#generator">Générateur de mots de passe</a> ·
+<a href="#settings">Menu Paramètres</a> ·
+<a href="#saving">Enregistrement et verrouillage</a> ·
+<a href="#shortcuts">Raccourcis clavier</a> ·
+<a href="#files">Vos fichiers</a>
+</p>
+
+<a name="concepts"></a>
+<h2>Principes</h2>
+<ul>
+  <li>Un <b>profil</b> est un fichier chiffré sur votre ordinateur. Il contient tout le reste.</li>
+  <li>Un <b>coffre</b> regroupe des éléments, comme un dossier (par ex. « Travail », « Banque »).
+      Il peut avoir sa propre icône et sa couleur.</li>
+  <li>Un <b>élément</b> correspond à un compte : ses identifiants, mots de passe, sites web, emails,
+      numéros de téléphone, codes TOTP et champs personnalisés. Chaque champ peut contenir plusieurs valeurs.</li>
+</ul>
+<p>Un profil est protégé par <b>deux mots de passe</b> :</p>
+<ul>
+  <li>le <b>mot de passe primaire</b> déchiffre le fichier du profil ;</li>
+  <li>le <b>mot de passe secondaire</b> déchiffre les secrets qu'il contient (mots de passe, secrets TOTP,
+      champs personnalisés secrets).</li>
+</ul>
+<p><b>Aucune récupération n'est possible :</b> si vous perdez l'un des deux, le profil ne peut plus être ouvert.</p>
+
+<a name="launch"></a>
+<h2>Écran de démarrage</h2>
+<p>Le choix de la langue, en haut à droite, change la langue de toute l'application.</p>
+<h3>Ouvrir un profil</h3>
+<ol>
+  <li>Choisissez <b>Ouvrir un coffre existant</b>.</li>
+  <li>Cliquez sur votre profil sous <b>Profils existants</b>, ou utilisez <b>Parcourir…</b> sous
+      <b>Ou choisissez un fichier</b> pour un fichier rangé ailleurs. Le dernier fichier ouvert est prérempli.</li>
+  <li>Saisissez le mot de passe primaire (<b>Identifiants primaires</b>), puis le mot de passe secondaire
+      (<b>Identifiants secondaires</b>).</li>
+</ol>
+<h3>Créer un profil</h3>
+<ol>
+  <li>Choisissez <b>Créer un nouveau profil</b> et saisissez un nom d'utilisateur. L'écran indique où le profil
+      sera enregistré (<code>~/bippass/&lt;nom&gt;.encrypted</code>). Un nom déjà utilisé est refusé.</li>
+  <li>Choisissez le mot de passe primaire et saisissez-le une seconde fois pour le confirmer,
+      puis faites de même pour le mot de passe secondaire.</li>
+</ol>
+<p>Le bouton <b>Afficher</b> / <b>Masquer</b> à côté de chaque champ de mot de passe révèle ce que vous avez tapé.</p>
+
+<a name="window"></a>
+<h2>Fenêtre principale</h2>
+<p>La fenêtre comporte une barre d'outils en haut et trois colonnes :</p>
+<ul>
+  <li><b>à gauche</b> : les coffres du profil ;</li>
+  <li><b>au centre</b> : les éléments du coffre sélectionné ;</li>
+  <li><b>à droite</b> : l'élément ouvert, affiché seulement quand un élément est ouvert.</li>
+</ul>
+
+<a name="toolbar"></a>
+<h2>Barre d'outils</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Commande</th><th>Rôle</th></tr>
+  <tr><td>Bouton soleil / lune</td><td>Bascule entre le thème clair et le thème sombre.</td></tr>
+  <tr><td>Choix de la langue</td><td>Change la langue d'affichage immédiatement, y compris dans l'élément ouvert.</td></tr>
+  <tr><td><b>Enregistrer</b></td><td>Applique les modifications de l'élément ouvert et enregistre le profil sur le disque.
+      Le bouton devient <b>orange</b> tant que des modifications ne sont pas enregistrées.</td></tr>
+  <tr><td><b>⚙ Paramètres</b></td><td>Ouvre le <a href="#settings">menu Paramètres</a>.</td></tr>
+</table>
+
+<a name="vaults"></a>
+<h2>Coffres (colonne de gauche)</h2>
+<ul>
+  <li>Cliquez sur un coffre pour afficher ses éléments. Les coffres sont triés par ordre alphabétique.</li>
+  <li><b>+ Nouveau coffre</b> crée un coffre vide.</li>
+  <li>Un clic droit sur un coffre propose :
+    <ul>
+      <li><b>Renommer</b> ;</li>
+      <li><b>Icône…</b> : choisissez une icône dans la grille (ou <b>Aucune</b>), puis sa couleur avec <b>Choisir une couleur…</b> ;</li>
+      <li><b>Supprimer</b> : supprime le coffre <b>et tous ses éléments</b>, après une confirmation qui indique combien il en contient.</li>
+    </ul>
+  </li>
+  <li>Déposez des éléments sur un coffre pour les y déplacer (voir <a href="#items">Éléments</a>).</li>
+</ul>
+
+<a name="items"></a>
+<h2>Éléments (colonne du centre)</h2>
+<ul>
+  <li>La ligne du haut indique le nom du coffre et le nombre d'éléments affichés sur le total.</li>
+  <li><b>Rechercher un élément…</b> filtre les éléments par nom.</li>
+  <li>Le choix du tri les classe par ordre <b>Alphabétique</b>, <b>Alphanumérique</b> (« item2 » avant « item10 »)
+      ou par <b>Date</b> de dernière modification ; le bouton flèche à côté inverse l'ordre.</li>
+  <li><b>Double-cliquez</b> sur un élément, ou sélectionnez-le et appuyez sur <b>Entrée</b>, pour l'ouvrir à droite.</li>
+  <li><b>+ Nouvel élément</b> crée un élément vide et l'ouvre directement en mode modification.</li>
+  <li>Un clic droit sur un élément propose <b>Ouvrir</b>, <b>Renommer</b>, <b>Icône…</b>, <b>Dupliquer</b>
+      (une copie dans le même coffre) ou <b>Supprimer</b> (après confirmation, irréversible).</li>
+  <li>Pour <b>déplacer des éléments vers un autre coffre</b>, sélectionnez-les (Ctrl+clic, Maj+clic,
+      ou <b>Ctrl+A</b> pour tous), puis faites-les glisser sur le coffre de destination et confirmez.</li>
+</ul>
+
+<a name="viewer"></a>
+<h2>Affichage d'un élément (colonne de droite)</h2>
+<p>L'en-tête affiche le nom de l'élément, la date de sa dernière modification et son icône.
+<b>Fermer</b> masque l'affichage.</p>
+
+<h3>Mode lecture</h3>
+<ul>
+  <li>Seuls les champs qui ont une valeur sont affichés.</li>
+  <li><b>Cliquez sur une valeur</b> pour la copier dans le presse-papiers ; elle devient brièvement verte.</li>
+  <li>Les mots de passe sont masqués : <b>Afficher</b> / <b>Masquer</b> les révèle. La copie copie toujours la vraie valeur.</li>
+  <li><b>Codes TOTP</b> affiche le code à 6 chiffres en cours et les secondes restantes avant qu'il change.
+      Un clic copie le code, jamais le secret.</li>
+  <li><b>Double-cliquez</b> sur un site web, une adresse email ou un numéro de téléphone pour l'ouvrir dans votre
+      navigateur, votre messagerie ou votre application d'appel, après confirmation.</li>
+  <li>Un <b>⚠</b> signale un site web, un email ou un numéro qui ne semble pas valide (survolez-le pour le détail).</li>
+</ul>
+
+<h3>Mode modification</h3>
+<p>Cliquez sur <b>Modifier</b> pour passer en mode modification. Tous les champs sont alors affichés, en clair,
+et modifiables :</p>
+<ul>
+  <li>Tapez le nom de l'élément directement dans le titre.</li>
+  <li><b>+ Ajouter une valeur</b> ajoute une valeur à un champ ; <b>✕</b> à côté d'une valeur la supprime.</li>
+  <li><b>Générer</b>, sous <b>Mots de passe</b>, ouvre le <a href="#generator">générateur de mots de passe</a> ;
+      le mot de passe obtenu est ajouté comme nouvelle valeur.</li>
+  <li>Les <b>Codes TOTP</b> se modifient sous forme de secret Base32 (la clé donnée par le site quand vous
+      activez la double authentification).</li>
+  <li><b>+ Champ personnalisé</b> ajoute un champ au nom de votre choix : <i>SCALAR</i> pour du texte en clair,
+      <i>ENCRYPTED</i> pour un secret. <b>✕</b> dans l'en-tête d'un champ personnalisé le supprime.</li>
+  <li><b>Double-cliquez sur l'icône</b> pour la changer : tapez dans la barre de recherche pour filtrer les logos fournis
+      (la première correspondance est sélectionnée, <b>Entrée</b> valide), choisissez-en un dans la liste,
+      ou utilisez <b>Parcourir…</b> pour prendre n'importe quelle image de votre ordinateur.</li>
+</ul>
+<p><b>Enregistrer</b> applique les modifications à l'élément et revient en mode lecture ; <b>Annuler</b> les abandonne.
+L'icône et les champs personnalisés ajoutés ou supprimés sont appliqués tout de suite : <b>Annuler</b> ne les défait pas.</p>
+<p>Si vous passez à un autre élément ou à un autre coffre, ou fermez l'affichage, avec des modifications non enregistrées,
+bippass demande s'il faut <b>Enregistrer</b>, <b>Abandonner</b> ou <b>Annuler</b>.</p>
+<p>Les modifications appliquées à un élément sont gardées en mémoire : elles arrivent sur le disque quand le profil
+est enregistré (voir <a href="#saving">Enregistrement</a>).</p>
+
+<a name="generator"></a>
+<h2>Générateur de mots de passe</h2>
+<p>Choisissez le type de mot de passe, réglez ses options, puis cliquez sur <b>Générer</b> (autant de fois que vous voulez).</p>
+<h3>Aléatoire</h3>
+<ul>
+  <li><b>Longueur</b> : de 1 à 256 caractères.</li>
+  <li><b>Minuscules (a-z)</b>, <b>Majuscules (A-Z)</b>, <b>Chiffres (0-9)</b> : les types de caractères à utiliser.</li>
+  <li><b>Caractères spéciaux</b> : cochez-le pour ajouter des caractères spéciaux ; la liste est modifiable,
+      et <b>↺</b> rétablit celle par défaut.</li>
+</ul>
+<h3>Facile à retenir</h3>
+<ul>
+  <li><b>Langue des mots</b> : mots anglais, français ou espagnols.</li>
+  <li><b>Nombre de mots</b>, <b>Chiffres par mot</b> et <b>Séparateur</b> entre les mots.</li>
+  <li><b>Mettre une majuscule à chaque mot</b>.</li>
+</ul>
+<p><b>Copier</b> copie le résultat ; <b>Utiliser ce mot de passe</b> l'ajoute à l'élément ; <b>Annuler</b> ferme sans l'utiliser.</p>
+
+<a name="settings"></a>
+<h2>Menu Paramètres (⚙ Paramètres)</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Entrée</th><th>Rôle</th></tr>
+  <tr><td><b>Métadonnées</b></td><td>Change le nom d'utilisateur du profil (le fichier du profil est renommé en conséquence ;
+      un nom déjà utilisé est refusé) et affiche la version du format du fichier.</td></tr>
+  <tr><td><b>Identifiants</b></td><td>Change le mot de passe primaire <i>ou</i> le secondaire, un seul à la fois.
+      Enregistrez ensuite pour l'appliquer au fichier.</td></tr>
+  <tr><td><b>Préférences</b></td><td>Thème, langue, et délai de fermeture automatique en secondes d'inactivité.</td></tr>
+  <tr><td><b>Exporter…</b></td><td>Copie les éléments cochés dans un nouveau fichier chiffré indépendant, protégé par
+      deux nouveaux mots de passe de votre choix. Le profil en cours n'est pas modifié.</td></tr>
+  <tr><td><b>Importer…</b></td><td>Ajoute les éléments d'un fichier exporté (il faut ses deux mots de passe) dans un coffre :
+      choisissez-en un existant ou tapez un nouveau nom (« éléments importés » par défaut).</td></tr>
+  <tr><td><b>Zoom avant</b> / <b>Zoom arrière</b> / <b>Réinitialiser le zoom</b></td><td>Agrandit ou réduit toute l'interface.</td></tr>
+  <tr><td><b>Mises à jour</b></td><td>Affiche votre version et un lien vers la page des versions.</td></tr>
+  <tr><td><b>Aide</b></td><td>Ouvre cette fenêtre.</td></tr>
+</table>
+
+<a name="saving"></a>
+<h2>Enregistrement et verrouillage automatique</h2>
+<ul>
+  <li>Les modifications restent en mémoire jusqu'à l'enregistrement du profil : avec <b>Enregistrer</b> dans la barre
+      d'outils, <b>Ctrl+S</b>, ou <b>Ctrl+K</b> (enregistrer et quitter).</li>
+  <li>À la fermeture de la fenêtre, bippass demande quoi faire des modifications de l'élément ouvert,
+      puis s'il faut enregistrer les modifications non enregistrées.</li>
+  <li>Après une période d'inactivité (réglée dans <b>Préférences</b>), bippass applique les modifications de l'élément
+      ouvert, enregistre le profil et se ferme. Si l'enregistrement échoue, la fenêtre reste ouverte.</li>
+  <li>Une fois la fenêtre fermée, les mots de passe sont effacés de la mémoire.</li>
+</ul>
+
+<a name="shortcuts"></a>
+<h2>Raccourcis clavier</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Raccourci</th><th>Action</th></tr>
+  <tr><td><b>Ctrl+S</b></td><td>Enregistrer (en mode modification, applique aussi les modifications de l'élément)</td></tr>
+  <tr><td><b>Ctrl+K</b></td><td>Enregistrer et quitter</td></tr>
+  <tr><td><b>Ctrl +</b> ou <b>Ctrl =</b></td><td>Zoom avant</td></tr>
+  <tr><td><b>Ctrl -</b></td><td>Zoom arrière</td></tr>
+  <tr><td><b>Ctrl 0</b></td><td>Réinitialiser le zoom</td></tr>
+  <tr><td><b>Ctrl+A</b></td><td>Sélectionner tous les éléments de la liste (quand la liste a le focus)</td></tr>
+  <tr><td><b>Ctrl+clic</b> / <b>Maj+clic</b></td><td>Sélectionner plusieurs éléments</td></tr>
+  <tr><td><b>Entrée</b> ou double-clic</td><td>Ouvrir l'élément sélectionné</td></tr>
+  <tr><td><b>Entrée</b> dans une boîte de dialogue</td><td>Valider (OK)</td></tr>
+</table>
+
+<a name="files"></a>
+<h2>Vos fichiers</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Emplacement</th><th>Contenu</th></tr>
+  <tr><td><code>~/.bippass/profiles/&lt;nom&gt;.encrypted</code></td><td>Vos profils. <b>Sauvegardez régulièrement ce dossier.</b></td></tr>
+  <tr><td><code>~/.bippass/recent.json</code></td><td>Le dernier profil ouvert.</td></tr>
+  <tr><td><code>~/.bippass/settings.json</code></td><td>Le thème de l'écran de démarrage.</td></tr>
+</table>
+
+</body>
+</html>

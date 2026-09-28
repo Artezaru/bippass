@@ -23,143 +23,272 @@ from pathlib import Path
 
 from PyQt5.QtWidgets import QApplication
 
-#: Where the chosen theme is remembered between runs.
-_SETTINGS_FILE_PATH = Path.home() / ".password_manager" / "settings.json"
-
-#: Theme used the first time the app runs, or if the setting can't be read.
-DEFAULT_THEME = "dark"
+from .common import _gui_icon_path
 
 
-def _palette(theme: str) -> dict[str, str]:
-    """Named colors for ``theme`` ("light" or "dark"), consumed by :func:`stylesheet`."""
-    if theme == "light":
-        return {
-            "bg": "#f5f5f7",
-            "bg_alt": "#ffffff",
-            "panel_bg": "#ffffff",
-            "border": "#d0d0d5",
-            "text": "#1e1e2e",
-            "text_muted": "#6b6b76",
-            "accent": "#6d4aff",
-            "accent_hover": "#5a40d4",
-            "accent_text": "#ffffff",
-            "input_bg": "#f0f0f3",
-            "field_bg": "#ffffff",
-            "value_bg": "#f5f5f5",
-            "error_bg": "#fdecea",
-            "error_text": "#b00020",
-            "warning_bg": "#fff3cd",
-            "warning_border": "#e0a800",
-            "success_bg": "#d8ffd8",
-            "danger": "#e5484d",
-            "danger_hover": "#c53030",
-            "danger_text": "#ffffff",
-            "unsaved": "#e0a800",
-            "unsaved_hover": "#c48f00",
-            "unsaved_text": "#1e1e2e",
-        }
-    # dark (default)
-    return {
-        "bg": "#1e1e2e",
-        "bg_alt": "#181825",
-        "panel_bg": "#24243a",
-        "border": "#45475a",
-        "text": "#cdd6f4",
-        "text_muted": "#8a8fa3",
-        "accent": "#89b4fa",
-        "accent_hover": "#74c7ec",
-        "accent_text": "#1e1e2e",
-        "input_bg": "#313244",
-        "field_bg": "#2a2a40",
-        "value_bg": "#2f2f47",
-        "error_bg": "#3a1f22",
-        "error_text": "#f38ba8",
-        "warning_bg": "#3a3320",
-        "warning_border": "#e0a800",
-        "success_bg": "#1f3a26",
-        "danger": "#f38ba8",
-        "danger_hover": "#eb6f92",
-        "danger_text": "#1e1e2e",
-        "unsaved": "#f9c74f",
-        "unsaved_hover": "#f4b942",
-        "unsaved_text": "#1e1e2e",
-    }
+LIGHT = "light"
+DARK = "dark"
+THEMES = (LIGHT, DARK)
+DEFAULT_THEME = DARK
+
+# Remembers the theme between runs, for the unlock wizard shown before
+# any manager (and its own theme setting) is decrypted.
+_SETTINGS_FILE_PATH = Path.home() / ".bippass" / "settings.json"
+
+_PALETTES: dict[str, dict[str, str]] = {
+    LIGHT: {
+        "bg": "#F4F5F7",
+        "bg_alt": "#FFFFFF",
+        "panel_bg": "#FFFFFF",
+        "border": "#E4E7EC",
+        "border_strong": "#CDD2DA",
+        "text": "#1F2937",
+        "text_muted": "#6B7280",
+        "disabled": "#A3AAB5",
+        "hover": "#F2F4F7",
+        "pressed": "#E8EBF0",
+        "accent": "#4F46E5",
+        "accent_hover": "#4338CA",
+        "accent_pressed": "#3730A3",
+        "accent_soft": "#EEF2FF",
+        "accent_disabled": "#A5B4FC",
+        "accent_text": "#FFFFFF",
+        "input_bg": "#FFFFFF",
+        "field_bg": "#FFFFFF",
+        "value_bg": "#F9FAFB",
+        "error_bg": "#FEF2F2",
+        "error_text": "#DC2626",
+        "warning_bg": "#FFFBEB",
+        "warning_border": "#F59E0B",
+        "success_bg": "#DCFCE7",
+        "danger": "#DC2626",
+        "danger_hover": "#B91C1C",
+        "danger_text": "#FFFFFF",
+        "unsaved": "#F59E0B",
+        "unsaved_hover": "#D97706",
+        "unsaved_text": "#1F2937",
+        "scroll": "#CDD2DA",
+    },
+    DARK: {
+        "bg": "#0F1115",
+        "bg_alt": "#181B21",
+        "panel_bg": "#181B21",
+        "border": "#2A2F38",
+        "border_strong": "#3A404B",
+        "text": "#E6E8EC",
+        "text_muted": "#9AA3AF",
+        "disabled": "#5B6270",
+        "hover": "#222630",
+        "pressed": "#2A2F3A",
+        "accent": "#6366F1",
+        "accent_hover": "#7C7FF5",
+        "accent_pressed": "#5558E3",
+        "accent_soft": "#23264A",
+        "accent_disabled": "#3B3E73",
+        "accent_text": "#FFFFFF",
+        "input_bg": "#12151A",
+        "field_bg": "#181B21",
+        "value_bg": "#1D2128",
+        "error_bg": "#2A1618",
+        "error_text": "#F87171",
+        "warning_bg": "#2E2715",
+        "warning_border": "#F59E0B",
+        "success_bg": "#14301F",
+        "danger": "#EF4444",
+        "danger_hover": "#DC2626",
+        "danger_text": "#FFFFFF",
+        "unsaved": "#F59E0B",
+        "unsaved_hover": "#D97706",
+        "unsaved_text": "#111827",
+        "scroll": "#3A404B",
+    },
+}
+
+
+def _valid_theme(theme: str | None) -> str:
+    """
+    Return a theme name, falling back to the default for unknown ones.
+
+    Parameters
+    ----------
+    theme : str or None
+        Theme name to check.
+
+    Returns
+    -------
+    str
+        ``theme`` if it is one of :data:`THEMES`, :data:`DEFAULT_THEME`
+        otherwise.
+    """
+    return theme if theme in THEMES else DEFAULT_THEME
+
+
+def _arrow_rule(theme: str) -> str:
+    """
+    Build the QSS rule drawing the themed combo box arrow.
+
+    Parameters
+    ----------
+    theme : str
+        Theme name.
+
+    Returns
+    -------
+    str
+        The rule, or ``""`` if the arrow image is missing, leaving Qt's
+        default arrow.
+
+    Notes
+    -----
+    QSS ``url()`` needs a file on disk and forward slashes, even on
+    Windows, hence ``as_posix()``.
+    """
+    path = _gui_icon_path(f"arrow_down_{theme}.svg")
+    if path is None:
+        return ""
+    return f"""
+        QComboBox::down-arrow {{
+            image: url({Path(path).as_posix()});
+            width: 10px;
+            height: 6px;
+            margin-right: 6px;
+        }}
+        QComboBox::down-arrow:on {{
+            top: 1px;
+        }}
+    """
 
 
 def stylesheet(theme: str, text_scale: float = 1.0) -> str:
     """
-    Build the full application QSS for ``theme`` ("light" or "dark").
+    Build the application's QSS for a theme.
 
-    Covers both the generic Qt widgets used by the wizard/main window
-    (``QMainWindow``, ``QGroupBox``, ``QLineEdit``, ``QPushButton``,
-    ``QListWidget``, ...) and the item viewer's own widgets
-    (``FieldRow``, ``ClickToCopyLabel``, ``WebsiteLabel``,
-    ``IconPreview``), matched by Python class name -- Qt style sheets
-    resolve class selectors through the whole inheritance chain, so
-    e.g. ``WebsiteLabel`` (a ``ClickToCopyLabel`` subclass) and
-    ``TotpFieldRow`` (a ``FieldRow`` subclass) pick up their base
-    class's rules automatically.
+    Covers the generic Qt widgets and the item viewer's own widgets
+    (``FieldRow``, ``ClickToCopyLabel``, ``IconPreview``), matched by
+    class name; subclasses such as ``TotpFieldRow`` or ``WebsiteLabel``
+    inherit their base class's rules.
 
     Parameters
     ----------
+    theme : str
+        ``"light"`` or ``"dark"``; any other value gives the default.
     text_scale : float, optional
-        Multiplier applied to the few ``font-size`` values hardcoded
-        below in ``px`` (default 1.0, i.e. unscaled). Every other
-        widget's text follows the application's own font instead, so
-        changing that font (see
-        ``PasswordManagerWindow._apply_zoom``) already scales it --
-        these ``px`` rules are the only text sizes that would
-        otherwise stay fixed and ignore the interface zoom, since an
-        explicit QSS ``font-size`` always overrides the inherited
-        widget font.
-    """
-    c = _palette(theme)
+        Interface zoom, applied to the few ``font-size`` values fixed
+        in ``px`` below, which would otherwise override the zoomed
+        application font. Default is ``1.0``.
 
-    def _px(base: float) -> int:
+    Returns
+    -------
+    str
+        The complete stylesheet.
+    """
+    theme = _valid_theme(theme)
+    c = _PALETTES[theme]
+
+    def px(base: float) -> int:
         return max(1, round(base * text_scale))
 
     return f"""
-        QMainWindow, QWidget {{
+        QMainWindow, QWidget, QDialog, QWizard {{
             background-color: {c['bg']};
             color: {c['text']};
         }}
-        QDialog, QWizard {{
-            background-color: {c['bg']};
-            color: {c['text']};
-        }}
+
+        /* --- Group boxes ---------------------------------------------- */
         QGroupBox {{
             border: 1px solid {c['border']};
-            border-radius: 6px;
-            margin-top: 12px;
-            padding-top: 10px;
-            color: {c['text']};
+            border-radius: 12px;
+            margin-top: 14px;
+            padding-top: 12px;
+            color: {c['text_muted']};
             font-weight: bold;
         }}
         QGroupBox::title {{
             subcontrol-origin: margin;
-            left: 10px;
+            left: 12px;
             padding: 0 4px;
         }}
-        QLineEdit, QTextEdit, QComboBox {{
+
+        /* --- Inputs --------------------------------------------------- */
+        QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox {{
             background-color: {c['input_bg']};
             border: 1px solid {c['border']};
-            border-radius: 4px;
-            padding: 6px;
+            border-radius: 8px;
+            padding: 6px 8px;
             color: {c['text']};
+            selection-background-color: {c['accent']};
+            selection-color: {c['accent_text']};
         }}
+        QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover,
+        QComboBox:hover, QSpinBox:hover {{
+            border-color: {c['border_strong']};
+        }}
+        QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus,
+        QComboBox:focus, QSpinBox:focus {{
+            border-color: {c['accent']};
+        }}
+        QLineEdit:disabled, QComboBox:disabled {{
+            color: {c['disabled']};
+        }}
+
+        /* --- Combo boxes ---------------------------------------------- */
+        QComboBox {{
+            padding-right: 28px;
+            min-height: 20px;
+        }}
+        QComboBox:on {{
+            border-color: {c['accent']};
+        }}
+        QComboBox::drop-down {{
+            subcontrol-origin: padding;
+            subcontrol-position: center right;
+            border: none;
+            width: 28px;
+        }}
+        {_arrow_rule(theme)}
+        QComboBox QAbstractItemView {{
+            background-color: {c['panel_bg']};
+            color: {c['text']};
+            border: 1px solid {c['border']};
+            border-radius: 8px;
+            padding: 4px;
+            outline: 0;
+            selection-background-color: {c['accent_soft']};
+            selection-color: {c['accent']};
+        }}
+        QComboBox QAbstractItemView::item {{
+            min-height: 24px;
+            padding: 4px 8px;
+            border-radius: 6px;
+        }}
+        QComboBox QAbstractItemView::item:hover {{
+            background-color: {c['hover']};
+        }}
+        QComboBox QAbstractItemView::item:selected {{
+            background-color: {c['accent_soft']};
+            color: {c['accent']};
+        }}
+
+        /* --- Buttons -------------------------------------------------- */
         QPushButton {{
             background-color: {c['accent']};
             color: {c['accent_text']};
-            border: none;
-            border-radius: 4px;
-            padding: 6px 12px;
-            font-weight: bold;
+            border: 1px solid {c['accent']};
+            border-radius: 8px;
+            padding: 7px 14px;
+            font-weight: 600;
         }}
         QPushButton:hover {{
             background-color: {c['accent_hover']};
+            border-color: {c['accent_hover']};
+        }}
+        QPushButton:pressed {{
+            background-color: {c['accent_pressed']};
+            border-color: {c['accent_pressed']};
         }}
         QPushButton:disabled {{
-            background-color: {c['border']};
+            background-color: {c['accent_disabled']};
+            border-color: {c['accent_disabled']};
             color: {c['text_muted']};
         }}
         QPushButton#smallButton {{
@@ -167,89 +296,185 @@ def stylesheet(theme: str, text_scale: float = 1.0) -> str:
         }}
         QPushButton#dangerButton {{
             background-color: {c['danger']};
+            border-color: {c['danger']};
             color: {c['danger_text']};
         }}
         QPushButton#dangerButton:hover {{
             background-color: {c['danger_hover']};
+            border-color: {c['danger_hover']};
         }}
         QPushButton#saveButton[dirty="true"] {{
             background-color: {c['unsaved']};
+            border-color: {c['unsaved']};
             color: {c['unsaved_text']};
         }}
         QPushButton#saveButton[dirty="true"]:hover {{
             background-color: {c['unsaved_hover']};
+            border-color: {c['unsaved_hover']};
         }}
+        QPushButton#editButton:disabled {{
+            background-color: {c['pressed']};
+            border-color: {c['border']};
+            color: {c['disabled']};
+        }}
+        QToolButton {{
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+            padding: 6px 10px;
+            color: {c['text_muted']};
+        }}
+        QToolButton:hover {{
+            background-color: {c['hover']};
+            color: {c['text']};
+        }}
+        QToolButton:pressed {{
+            background-color: {c['pressed']};
+        }}
+        QToolButton:checked {{
+            color: {c['accent']};
+        }}
+
+        /* --- Lists ---------------------------------------------------- */
         QListWidget {{
             background-color: {c['bg_alt']};
             border: 1px solid {c['border']};
-            border-radius: 4px;
+            border-radius: 12px;
+            padding: 4px;
             color: {c['text']};
+            outline: 0;
         }}
+        QListWidget::item {{
+            padding: 6px 8px;
+            border-radius: 8px;
+        }}
+        QListWidget::item:hover {{
+            background-color: {c['hover']};
+        }}
+        QListWidget::item:selected {{
+            background-color: {c['accent_soft']};
+            color: {c['accent']};
+        }}
+
+        /* --- Containers ----------------------------------------------- */
         QScrollArea {{
             background-color: transparent;
             border: 1px solid {c['border']};
-            border-radius: 4px;
+            border-radius: 12px;
         }}
         QToolBar {{
             background-color: {c['bg_alt']};
             border: none;
+            border-bottom: 1px solid {c['border']};
             spacing: 4px;
+            padding: 4px;
         }}
         QMenu {{
             background-color: {c['panel_bg']};
             color: {c['text']};
             border: 1px solid {c['border']};
+            border-radius: 8px;
+            padding: 4px;
+        }}
+        QMenu::item {{
+            padding: 6px 14px;
+            border-radius: 6px;
         }}
         QMenu::item:selected {{
-            background-color: {c['accent']};
-            color: {c['accent_text']};
+            background-color: {c['accent_soft']};
+            color: {c['accent']};
         }}
+        QToolTip {{
+            background-color: {c['panel_bg']};
+            color: {c['text']};
+            border: 1px solid {c['border']};
+            border-radius: 6px;
+            padding: 4px 8px;
+        }}
+
+        /* --- Scrollbars ----------------------------------------------- */
+        QScrollBar:vertical {{
+            background: transparent;
+            width: 10px;
+            margin: 2px;
+        }}
+        QScrollBar::handle:vertical {{
+            background: {c['scroll']};
+            border-radius: 3px;
+            min-height: 32px;
+        }}
+        QScrollBar:horizontal {{
+            background: transparent;
+            height: 10px;
+            margin: 2px;
+        }}
+        QScrollBar::handle:horizontal {{
+            background: {c['scroll']};
+            border-radius: 3px;
+            min-width: 32px;
+        }}
+        QScrollBar::add-line, QScrollBar::sub-line {{
+            width: 0;
+            height: 0;
+        }}
+        QScrollBar::add-page, QScrollBar::sub-page {{
+            background: none;
+        }}
+
+        /* --- Labels --------------------------------------------------- */
         QLabel {{
             color: {c['text']};
+            background: transparent;
         }}
         QLabel#sectionTitle {{
-            font-size: {_px(16)}px;
-            font-weight: bold;
+            font-size: {px(16)}px;
+            font-weight: 600;
         }}
         QLabel#fieldLabelHeader {{
-            font-weight: bold;
+            font-weight: 600;
             color: {c['text_muted']};
             border: none;
             background: transparent;
         }}
         QLabel#mutedLabel {{
             color: {c['text_muted']};
-            font-size: {_px(11)}px;
+            font-size: {px(11)}px;
         }}
         QLabel#errorLabel {{
             color: {c['error_text']};
             background-color: {c['error_bg']};
-            padding: 6px;
-            border-radius: 4px;
+            padding: 8px 10px;
+            border-radius: 8px;
         }}
         QLineEdit#itemTitleEdit {{
             background: transparent;
             border: none;
             border-bottom: 1px solid transparent;
             border-radius: 0;
-            font-size: {_px(18)}px;
-            font-weight: bold;
+            font-size: {px(18)}px;
+            font-weight: 600;
             padding: 4px 2px;
         }}
         QLineEdit#itemTitleEdit:focus {{
             border-bottom: 1px solid {c['accent']};
         }}
+
+        /* --- Item viewer ---------------------------------------------- */
         FieldRow {{
             background-color: {c['field_bg']};
             border: 1px solid {c['border']};
-            border-radius: 6px;
+            border-radius: 10px;
             margin: 2px;
         }}
         ClickToCopyLabel {{
-            padding: 4px;
+            padding: 6px 8px;
             background-color: {c['value_bg']};
-            border-radius: 4px;
+            border: 1px solid transparent;
+            border-radius: 8px;
             color: {c['text']};
+        }}
+        ClickToCopyLabel:hover {{
+            border-color: {c['border_strong']};
         }}
         ClickToCopyLabel[state="flash"] {{
             background-color: {c['success_bg']};
@@ -260,64 +485,80 @@ def stylesheet(theme: str, text_scale: float = 1.0) -> str:
         }}
         IconPreview {{
             border: 1px solid {c['border']};
-            border-radius: 6px;
+            border-radius: 10px;
             background-color: {c['bg_alt']};
         }}
     """
 
 
+def apply_theme(app: QApplication, theme: str, text_scale: float = 1.0) -> None:
+    """
+    Apply a theme to the whole application.
+
+    Can be called again at any time (theme toggle, zoom): Qt
+    re-polishes every widget.
+
+    Parameters
+    ----------
+    app : QApplication
+        The application.
+    theme : str
+        ``"light"`` or ``"dark"``.
+    text_scale : float, optional
+        Current interface zoom, see :func:`stylesheet`. Default is
+        ``1.0``.
+    """
+    app.setStyleSheet(stylesheet(theme, text_scale))
+
+
+def _read_settings() -> dict:
+    """
+    Read the settings file.
+
+    Returns
+    -------
+    dict
+        The stored settings, empty if the file is missing, unreadable
+        or not a JSON object.
+    """
+    try:
+        settings = json.loads(_SETTINGS_FILE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
 def load_theme() -> str:
     """
-    Return the last chosen theme.
+    Return the last theme chosen.
 
     Returns
     -------
     str
-        ``"light"`` or ``"dark"``, from the settings file, or
-        :data:`DEFAULT_THEME` if there is no settings file yet or it
-        can't be read/parsed.
+        The stored theme, or :data:`DEFAULT_THEME` if none is stored
+        or it isn't valid.
     """
-    try:
-        raw = json.loads(_SETTINGS_FILE_PATH.read_text(encoding="utf-8"))
-        theme = raw.get("theme")
-        if theme in ("light", "dark"):
-            return theme
-    except (OSError, ValueError, json.JSONDecodeError):
-        pass
-    return DEFAULT_THEME
+    return _valid_theme(_read_settings().get("theme"))
 
 
 def save_theme(theme: str) -> None:
     """
-    Best-effort persist of ``theme`` ("light" or "dark") for next launch.
-
-    Silently does nothing on a write failure (e.g. read-only home
-    directory): the theme toggle still works for the current session,
-    it just won't be remembered.
-    """
-    try:
-        _SETTINGS_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _SETTINGS_FILE_PATH.write_text(
-            json.dumps({"theme": theme}),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
-
-
-def apply_theme(app: QApplication, theme: str, text_scale: float = 1.0) -> None:
-    """
-    Apply ``theme`` ("light" or "dark") as the whole application's
-    stylesheet. Safe to call again later (e.g. from a toggle button,
-    or the interface zoom) to switch themes/text scale at runtime --
-    Qt re-polishes every widget.
+    Remember a theme for the next run, keeping the other settings.
 
     Parameters
     ----------
-    text_scale : float, optional
-        Forwarded to :func:`stylesheet` -- pass the interface's
-        current zoom scale so re-applying the theme (e.g. on a theme
-        or language change) doesn't reset the few hardcoded ``px``
-        font sizes back to their unzoomed size.
+    theme : str
+        ``"light"`` or ``"dark"``.
+
+    Notes
+    -----
+    Best effort: a write failure (e.g. read-only home folder) is
+    ignored, the theme just isn't remembered.
     """
-    app.setStyleSheet(stylesheet(theme, text_scale))
+    settings = _read_settings()
+    settings["theme"] = _valid_theme(theme)
+    try:
+        _SETTINGS_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _SETTINGS_FILE_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    except OSError:
+        pass

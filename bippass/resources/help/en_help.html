@@ -1,0 +1,218 @@
+<html>
+<body>
+
+<h1>bippass — Help</h1>
+
+<p>
+<a href="#concepts">Concepts</a> ·
+<a href="#launch">Launch screen</a> ·
+<a href="#window">Main window</a> ·
+<a href="#toolbar">Toolbar</a> ·
+<a href="#vaults">Vaults</a> ·
+<a href="#items">Items</a> ·
+<a href="#viewer">Item viewer</a> ·
+<a href="#generator">Password generator</a> ·
+<a href="#settings">Settings menu</a> ·
+<a href="#saving">Saving and auto-lock</a> ·
+<a href="#shortcuts">Keyboard shortcuts</a> ·
+<a href="#files">Your files</a>
+</p>
+
+<a name="concepts"></a>
+<h2>Concepts</h2>
+<ul>
+  <li>A <b>profile</b> is one encrypted file on your computer. It holds everything below.</li>
+  <li>A <b>vault</b> groups items, like a folder (e.g. "Work", "Banking"). It can have its own icon and color.</li>
+  <li>An <b>item</b> is one account: its logins, passwords, websites, emails, phone numbers,
+      TOTP codes and custom fields. Each field can hold several values.</li>
+</ul>
+<p>A profile is protected by <b>two passwords</b>:</p>
+<ul>
+  <li>the <b>primary password</b> decrypts the profile file;</li>
+  <li>the <b>secondary password</b> decrypts the secrets inside it (passwords, TOTP secrets,
+      secret custom fields).</li>
+</ul>
+<p><b>There is no password recovery:</b> if you lose one of them, the profile cannot be opened anymore.</p>
+
+<a name="launch"></a>
+<h2>Launch screen</h2>
+<p>The language selector at the top right changes the language of the whole application.</p>
+<h3>Opening a profile</h3>
+<ol>
+  <li>Choose <b>Open an existing vault</b>.</li>
+  <li>Click your profile under <b>Existing profiles</b>, or use <b>Browse…</b> under
+      <b>Or choose a vault file</b> for a file stored elsewhere. The last file opened is pre-filled.</li>
+  <li>Enter the primary password (<b>Primary credentials</b>), then the secondary password
+      (<b>Secondary credentials</b>).</li>
+</ol>
+<h3>Creating a profile</h3>
+<ol>
+  <li>Choose <b>Create a new profile</b> and type a username. The screen shows where the profile
+      will be saved (<code>~/bippass/&lt;username&gt;.encrypted</code>). A username already in use is refused.</li>
+  <li>Choose the primary password and type it again to confirm, then do the same for the secondary password.</li>
+</ol>
+<p>The <b>Show</b> / <b>Hide</b> button next to each password field reveals what you typed.</p>
+
+<a name="window"></a>
+<h2>Main window</h2>
+<p>The window has a toolbar at the top and three columns:</p>
+<ul>
+  <li><b>left</b>: the vaults of the profile;</li>
+  <li><b>middle</b>: the items of the selected vault;</li>
+  <li><b>right</b>: the open item, shown only once an item is opened.</li>
+</ul>
+
+<a name="toolbar"></a>
+<h2>Toolbar</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Control</th><th>What it does</th></tr>
+  <tr><td>Sun / moon button</td><td>Switches between the light and dark themes.</td></tr>
+  <tr><td>Language selector</td><td>Changes the display language right away, including in the open item.</td></tr>
+  <tr><td><b>Save</b></td><td>Applies the edits of the open item and saves the profile to disk.
+      The button turns <b>orange</b> while there are unsaved changes.</td></tr>
+  <tr><td><b>⚙ Settings</b></td><td>Opens the <a href="#settings">Settings menu</a>.</td></tr>
+</table>
+
+<a name="vaults"></a>
+<h2>Vaults (left column)</h2>
+<ul>
+  <li>Click a vault to show its items. Vaults are sorted alphabetically.</li>
+  <li><b>+ New vault</b> creates an empty vault.</li>
+  <li>Right-click a vault for:
+    <ul>
+      <li><b>Rename</b>;</li>
+      <li><b>Icon…</b>: pick an icon in the grid (or <b>None</b>), then its color with <b>Choose color…</b>;</li>
+      <li><b>Delete</b>: deletes the vault <b>and all its items</b>, after a confirmation telling how many items it holds.</li>
+    </ul>
+  </li>
+  <li>Drop items onto a vault to move them there (see <a href="#items">Items</a>).</li>
+</ul>
+
+<a name="items"></a>
+<h2>Items (middle column)</h2>
+<ul>
+  <li>The top line shows the vault's name and how many items are shown out of the total.</li>
+  <li><b>Search an item…</b> filters the items by name.</li>
+  <li>The sort selector orders them <b>Alphabetic</b>, <b>Alphanumeric</b> ("item2" before "item10")
+      or by <b>Date</b> of last change; the arrow button next to it reverses the order.</li>
+  <li><b>Double-click</b> an item, or select it and press <b>Enter</b>, to open it on the right.</li>
+  <li><b>+ New item</b> creates an empty item and opens it directly in edit mode.</li>
+  <li>Right-click an item for <b>Open</b>, <b>Rename</b>, <b>Icon…</b>, <b>Duplicate</b> (a copy in the same vault)
+      or <b>Delete</b> (after confirmation, cannot be undone).</li>
+  <li>To <b>move items to another vault</b>, select them (Ctrl+click, Shift+click, or <b>Ctrl+A</b> for all),
+      then drag them onto the target vault and confirm.</li>
+</ul>
+
+<a name="viewer"></a>
+<h2>Item viewer (right column)</h2>
+<p>The header shows the item's name, the date of its last change and its icon.
+<b>Close</b> hides the viewer.</p>
+
+<h3>Read mode</h3>
+<ul>
+  <li>Only the fields that have a value are shown.</li>
+  <li><b>Click a value</b> to copy it to the clipboard; it briefly turns green.</li>
+  <li>Passwords are masked: <b>Show</b> / <b>Hide</b> reveals them. Copying always copies the real value.</li>
+  <li><b>TOTP codes</b> shows the current 6-digit code and the seconds left before it changes.
+      Clicking copies the code, never the secret.</li>
+  <li><b>Double-click</b> a website, an email address or a phone number to open it in your browser,
+      mail application or phone application, after confirmation.</li>
+  <li>A <b>⚠</b> marks a website, email or phone number that doesn't look valid (hover it for details).</li>
+</ul>
+
+<h3>Edit mode</h3>
+<p>Click <b>Edit</b> to switch to edit mode. Every field is then shown, in clear, and can be changed:</p>
+<ul>
+  <li>Type the item's name directly in the title.</li>
+  <li><b>+ Add value</b> adds a value to a field; <b>✕</b> next to a value removes it.</li>
+  <li><b>Generate</b>, under <b>Passwords</b>, opens the <a href="#generator">password generator</a>;
+      the password it produces is added as a new value.</li>
+  <li><b>TOTP codes</b> are edited as their Base32 secret (the key given by the website when you
+      enable two-factor authentication).</li>
+  <li><b>+ Custom field</b> adds a field with a name of your choice: <i>SCALAR</i> for plain text,
+      <i>ENCRYPTED</i> for a secret. <b>✕</b> in a custom field's header removes it.</li>
+  <li><b>Double-click the icon</b> to change it: type in the search bar to filter the bundled logos
+      (the first match is selected, <b>Enter</b> validates), pick one in the list, or use <b>Browse…</b>
+      to choose any image from your computer.</li>
+</ul>
+<p><b>Save</b> applies the changes to the item and returns to read mode; <b>Cancel</b> discards them.
+The icon and the custom fields added or removed are applied right away, <b>Cancel</b> doesn't undo them.</p>
+<p>If you switch to another item or vault, or close the viewer, with unsaved changes,
+bippass asks whether to <b>Save</b>, <b>Discard</b> or <b>Cancel</b>.</p>
+<p>Changes applied to an item are kept in memory: they reach the disk when the profile is saved
+(see <a href="#saving">Saving</a>).</p>
+
+<a name="generator"></a>
+<h2>Password generator</h2>
+<p>Choose the type of password, set its options, then click <b>Generate</b> (as many times as you like).</p>
+<h3>Random</h3>
+<ul>
+  <li><b>Length</b>: from 1 to 256 characters.</li>
+  <li><b>Lowercase (a-z)</b>, <b>Uppercase (A-Z)</b>, <b>Digits (0-9)</b>: the character classes to use.</li>
+  <li><b>Special characters</b>: tick it to add special characters; the list can be edited,
+      and <b>↺</b> restores the default one.</li>
+</ul>
+<h3>Easy to remember</h3>
+<ul>
+  <li><b>Word language</b>: English, French or Spanish words.</li>
+  <li><b>Number of words</b>, <b>Digits per word</b> and <b>Separator</b> between words.</li>
+  <li><b>Capitalize each word</b>.</li>
+</ul>
+<p><b>Copy</b> copies the result; <b>Use this password</b> adds it to the item; <b>Cancel</b> closes without using it.</p>
+
+<a name="settings"></a>
+<h2>Settings menu (⚙ Settings)</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Entry</th><th>What it does</th></tr>
+  <tr><td><b>Metadata</b></td><td>Changes the profile's username (the profile file is renamed to match;
+      a username already in use is refused) and shows the file format version.</td></tr>
+  <tr><td><b>Credentials</b></td><td>Changes the primary <i>or</i> the secondary password, one at a time.
+      Save afterwards to apply it to the file.</td></tr>
+  <tr><td><b>Preferences</b></td><td>Theme, language, and the auto-close delay in seconds of inactivity.</td></tr>
+  <tr><td><b>Export…</b></td><td>Copies the items you tick into a new, separate encrypted file, protected by
+      two new passwords of your choice. The current profile is not modified.</td></tr>
+  <tr><td><b>Import…</b></td><td>Adds the items of an exported file (you need its two passwords) into a vault:
+      pick an existing one or type a new name ("imported items" by default).</td></tr>
+  <tr><td><b>Zoom in</b> / <b>Zoom out</b> / <b>Reset zoom</b></td><td>Enlarges or shrinks the whole interface.</td></tr>
+  <tr><td><b>Updates</b></td><td>Shows your version and a link to the releases page.</td></tr>
+  <tr><td><b>Help</b></td><td>Opens this window.</td></tr>
+</table>
+
+<a name="saving"></a>
+<h2>Saving and auto-lock</h2>
+<ul>
+  <li>Changes are kept in memory until the profile is saved: with <b>Save</b> in the toolbar,
+      <b>Ctrl+S</b>, or <b>Ctrl+K</b> (save and exit).</li>
+  <li>When you close the window, bippass asks what to do with the edits of the open item,
+      then whether to save the unsaved changes.</li>
+  <li>After a period of inactivity (set in <b>Preferences</b>), bippass applies the edits of the open item,
+      saves the profile and closes. If the save fails, the window stays open.</li>
+  <li>Once the window is closed, the passwords are cleared from memory.</li>
+</ul>
+
+<a name="shortcuts"></a>
+<h2>Keyboard shortcuts</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Shortcut</th><th>Action</th></tr>
+  <tr><td><b>Ctrl+S</b></td><td>Save (in edit mode, also applies the item's changes)</td></tr>
+  <tr><td><b>Ctrl+K</b></td><td>Save and exit</td></tr>
+  <tr><td><b>Ctrl +</b> or <b>Ctrl =</b></td><td>Zoom in</td></tr>
+  <tr><td><b>Ctrl -</b></td><td>Zoom out</td></tr>
+  <tr><td><b>Ctrl 0</b></td><td>Reset zoom</td></tr>
+  <tr><td><b>Ctrl+A</b></td><td>Select every item of the list (when the list has the focus)</td></tr>
+  <tr><td><b>Ctrl+click</b> / <b>Shift+click</b></td><td>Select several items</td></tr>
+  <tr><td><b>Enter</b> or double-click</td><td>Open the selected item</td></tr>
+  <tr><td><b>Enter</b> in a dialog</td><td>Validate (OK)</td></tr>
+</table>
+
+<a name="files"></a>
+<h2>Your files</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Location</th><th>Content</th></tr>
+  <tr><td><code>~/.bippass/profiles/&lt;username&gt;.encrypted</code></td><td>Your profiles. <b>Back up this folder regularly.</b></td></tr>
+  <tr><td><code>~/.bippass/recent.json</code></td><td>The last profile opened.</td></tr>
+  <tr><td><code>~/.bippass/settings.json</code></td><td>The theme of the launch screen.</td></tr>
+</table>
+
+</body>
+</html>

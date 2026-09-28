@@ -1,0 +1,219 @@
+<html>
+<body>
+
+<h1>bippass — Ayuda</h1>
+
+<p>
+<a href="#concepts">Conceptos</a> ·
+<a href="#launch">Pantalla de inicio</a> ·
+<a href="#window">Ventana principal</a> ·
+<a href="#toolbar">Barra de herramientas</a> ·
+<a href="#vaults">Cajas fuertes</a> ·
+<a href="#items">Elementos</a> ·
+<a href="#viewer">Vista de un elemento</a> ·
+<a href="#generator">Generador de contraseñas</a> ·
+<a href="#settings">Menú Ajustes</a> ·
+<a href="#saving">Guardado y bloqueo</a> ·
+<a href="#shortcuts">Atajos de teclado</a> ·
+<a href="#files">Sus archivos</a>
+</p>
+
+<a name="concepts"></a>
+<h2>Conceptos</h2>
+<ul>
+  <li>Un <b>perfil</b> es un archivo cifrado en su ordenador. Contiene todo lo demás.</li>
+  <li>Una <b>caja fuerte</b> agrupa elementos, como una carpeta (p. ej. «Trabajo», «Banco»).
+      Puede tener su propio icono y color.</li>
+  <li>Un <b>elemento</b> corresponde a una cuenta: sus nombres de usuario, contraseñas, sitios web, correos,
+      números de teléfono, códigos TOTP y campos personalizados. Cada campo puede contener varios valores.</li>
+</ul>
+<p>Un perfil está protegido por <b>dos contraseñas</b>:</p>
+<ul>
+  <li>la <b>contraseña primaria</b> descifra el archivo del perfil;</li>
+  <li>la <b>contraseña secundaria</b> descifra los secretos que contiene (contraseñas, secretos TOTP,
+      campos personalizados secretos).</li>
+</ul>
+<p><b>No es posible recuperar las contraseñas:</b> si pierde una de ellas, el perfil ya no podrá abrirse.</p>
+
+<a name="launch"></a>
+<h2>Pantalla de inicio</h2>
+<p>El selector de idioma, arriba a la derecha, cambia el idioma de toda la aplicación.</p>
+<h3>Abrir un perfil</h3>
+<ol>
+  <li>Elija <b>Abrir una caja fuerte existente</b>.</li>
+  <li>Haga clic en su perfil en <b>Perfiles existentes</b>, o use <b>Examinar…</b> en
+      <b>O elija un archivo</b> para un archivo guardado en otro lugar. El último archivo abierto aparece ya rellenado.</li>
+  <li>Introduzca la contraseña primaria (<b>Credenciales primarias</b>) y luego la secundaria
+      (<b>Credenciales secundarias</b>).</li>
+</ol>
+<h3>Crear un perfil</h3>
+<ol>
+  <li>Elija <b>Crear un nuevo perfil</b> y escriba un nombre de usuario. La pantalla indica dónde se guardará
+      el perfil (<code>~/bippass/&lt;nombre&gt;.encrypted</code>). Un nombre ya usado se rechaza.</li>
+  <li>Elija la contraseña primaria y escríbala otra vez para confirmarla; haga lo mismo con la secundaria.</li>
+</ol>
+<p>El botón <b>Mostrar</b> / <b>Ocultar</b> junto a cada campo de contraseña muestra lo que ha escrito.</p>
+
+<a name="window"></a>
+<h2>Ventana principal</h2>
+<p>La ventana tiene una barra de herramientas arriba y tres columnas:</p>
+<ul>
+  <li><b>izquierda</b>: las cajas fuertes del perfil;</li>
+  <li><b>centro</b>: los elementos de la caja fuerte seleccionada;</li>
+  <li><b>derecha</b>: el elemento abierto, visible solo cuando se abre un elemento.</li>
+</ul>
+
+<a name="toolbar"></a>
+<h2>Barra de herramientas</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Control</th><th>Función</th></tr>
+  <tr><td>Botón sol / luna</td><td>Cambia entre el tema claro y el oscuro.</td></tr>
+  <tr><td>Selector de idioma</td><td>Cambia el idioma al instante, también en el elemento abierto.</td></tr>
+  <tr><td><b>Guardar</b></td><td>Aplica los cambios del elemento abierto y guarda el perfil en el disco.
+      El botón se vuelve <b>naranja</b> mientras haya cambios sin guardar.</td></tr>
+  <tr><td><b>⚙ Ajustes</b></td><td>Abre el <a href="#settings">menú Ajustes</a>.</td></tr>
+</table>
+
+<a name="vaults"></a>
+<h2>Cajas fuertes (columna izquierda)</h2>
+<ul>
+  <li>Haga clic en una caja fuerte para ver sus elementos. Se ordenan alfabéticamente.</li>
+  <li><b>+ Nueva caja fuerte</b> crea una caja fuerte vacía.</li>
+  <li>Con clic derecho sobre una caja fuerte:
+    <ul>
+      <li><b>Renombrar</b>;</li>
+      <li><b>Icono…</b>: elija un icono en la cuadrícula (o <b>Ninguno</b>) y luego su color con <b>Elegir un color…</b>;</li>
+      <li><b>Eliminar</b>: elimina la caja fuerte <b>y todos sus elementos</b>, tras una confirmación que indica cuántos contiene.</li>
+    </ul>
+  </li>
+  <li>Suelte elementos sobre una caja fuerte para moverlos a ella (ver <a href="#items">Elementos</a>).</li>
+</ul>
+
+<a name="items"></a>
+<h2>Elementos (columna central)</h2>
+<ul>
+  <li>La línea superior indica el nombre de la caja fuerte y cuántos elementos se muestran del total.</li>
+  <li><b>Buscar un elemento…</b> filtra los elementos por nombre.</li>
+  <li>El selector de orden los clasifica en orden <b>Alfabético</b>, <b>Alfanumérico</b> («item2» antes que «item10»)
+      o por <b>Fecha</b> de última modificación; el botón de flecha invierte el orden.</li>
+  <li>Haga <b>doble clic</b> en un elemento, o selecciónelo y pulse <b>Intro</b>, para abrirlo a la derecha.</li>
+  <li><b>+ Nuevo elemento</b> crea un elemento vacío y lo abre directamente en modo edición.</li>
+  <li>Con clic derecho sobre un elemento: <b>Abrir</b>, <b>Renombrar</b>, <b>Icono…</b>, <b>Duplicar</b>
+      (una copia en la misma caja fuerte) o <b>Eliminar</b> (tras confirmación, no se puede deshacer).</li>
+  <li>Para <b>mover elementos a otra caja fuerte</b>, selecciónelos (Ctrl+clic, Mayús+clic, o <b>Ctrl+A</b> para todos),
+      arrástrelos sobre la caja fuerte de destino y confirme.</li>
+</ul>
+
+<a name="viewer"></a>
+<h2>Vista de un elemento (columna derecha)</h2>
+<p>La cabecera muestra el nombre del elemento, la fecha de su última modificación y su icono.
+<b>Cerrar</b> oculta la vista.</p>
+
+<h3>Modo lectura</h3>
+<ul>
+  <li>Solo se muestran los campos que tienen un valor.</li>
+  <li><b>Haga clic en un valor</b> para copiarlo al portapapeles; se vuelve verde un instante.</li>
+  <li>Las contraseñas están ocultas: <b>Mostrar</b> / <b>Ocultar</b> las revela. La copia siempre copia el valor real.</li>
+  <li><b>Códigos TOTP</b> muestra el código de 6 dígitos actual y los segundos que faltan para que cambie.
+      Un clic copia el código, nunca el secreto.</li>
+  <li>Haga <b>doble clic</b> en un sitio web, un correo o un número de teléfono para abrirlo en su navegador,
+      su aplicación de correo o de llamadas, tras confirmación.</li>
+  <li>Un <b>⚠</b> señala un sitio web, correo o número que no parece válido (pase el ratón por encima para ver el detalle).</li>
+</ul>
+
+<h3>Modo edición</h3>
+<p>Haga clic en <b>Editar</b> para pasar al modo edición. Todos los campos se muestran entonces, en claro, y se pueden modificar:</p>
+<ul>
+  <li>Escriba el nombre del elemento directamente en el título.</li>
+  <li><b>+ Añadir un valor</b> añade un valor a un campo; <b>✕</b> junto a un valor lo elimina.</li>
+  <li><b>Generar</b>, bajo <b>Contraseñas</b>, abre el <a href="#generator">generador de contraseñas</a>;
+      la contraseña obtenida se añade como un nuevo valor.</li>
+  <li>Los <b>Códigos TOTP</b> se editan como su secreto Base32 (la clave que da el sitio al activar la
+      autenticación en dos pasos).</li>
+  <li><b>+ Campo personalizado</b> añade un campo con el nombre que elija: <i>SCALAR</i> para texto en claro,
+      <i>ENCRYPTED</i> para un secreto. <b>✕</b> en la cabecera de un campo personalizado lo elimina.</li>
+  <li>Haga <b>doble clic en el icono</b> para cambiarlo: escriba en la barra de búsqueda para filtrar los logotipos incluidos
+      (se selecciona la primera coincidencia, <b>Intro</b> valida), elija uno de la lista,
+      o use <b>Examinar…</b> para tomar cualquier imagen de su ordenador.</li>
+</ul>
+<p><b>Guardar</b> aplica los cambios al elemento y vuelve al modo lectura; <b>Cancelar</b> los descarta.
+El icono y los campos personalizados añadidos o eliminados se aplican al instante: <b>Cancelar</b> no los deshace.</p>
+<p>Si cambia de elemento o de caja fuerte, o cierra la vista, con cambios sin guardar,
+bippass pregunta si desea <b>Guardar</b>, <b>Descartar</b> o <b>Cancelar</b>.</p>
+<p>Los cambios aplicados a un elemento se conservan en memoria: llegan al disco cuando se guarda el perfil
+(ver <a href="#saving">Guardado</a>).</p>
+
+<a name="generator"></a>
+<h2>Generador de contraseñas</h2>
+<p>Elija el tipo de contraseña, ajuste sus opciones y haga clic en <b>Generar</b> (tantas veces como quiera).</p>
+<h3>Aleatoria</h3>
+<ul>
+  <li><b>Longitud</b>: de 1 a 256 caracteres.</li>
+  <li><b>Minúsculas (a-z)</b>, <b>Mayúsculas (A-Z)</b>, <b>Dígitos (0-9)</b>: los tipos de caracteres que se usan.</li>
+  <li><b>Caracteres especiales</b>: márquelo para añadir caracteres especiales; la lista se puede editar,
+      y <b>↺</b> restablece la lista por defecto.</li>
+</ul>
+<h3>Fácil de recordar</h3>
+<ul>
+  <li><b>Idioma de las palabras</b>: palabras en inglés, francés o español.</li>
+  <li><b>Número de palabras</b>, <b>Dígitos por palabra</b> y <b>Separador</b> entre palabras.</li>
+  <li><b>Poner mayúscula a cada palabra</b>.</li>
+</ul>
+<p><b>Copiar</b> copia el resultado; <b>Usar esta contraseña</b> la añade al elemento; <b>Cancelar</b> cierra sin usarla.</p>
+
+<a name="settings"></a>
+<h2>Menú Ajustes (⚙ Ajustes)</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Entrada</th><th>Función</th></tr>
+  <tr><td><b>Metadatos</b></td><td>Cambia el nombre de usuario del perfil (el archivo del perfil se renombra en consecuencia;
+      un nombre ya usado se rechaza) y muestra la versión del formato del archivo.</td></tr>
+  <tr><td><b>Credenciales</b></td><td>Cambia la contraseña primaria <i>o</i> la secundaria, una cada vez.
+      Guarde después para aplicarla al archivo.</td></tr>
+  <tr><td><b>Preferencias</b></td><td>Tema, idioma y retraso de cierre automático en segundos de inactividad.</td></tr>
+  <tr><td><b>Exportar…</b></td><td>Copia los elementos marcados en un nuevo archivo cifrado independiente, protegido por
+      dos nuevas contraseñas que usted elige. El perfil actual no se modifica.</td></tr>
+  <tr><td><b>Importar…</b></td><td>Añade los elementos de un archivo exportado (necesita sus dos contraseñas) a una caja fuerte:
+      elija una existente o escriba un nombre nuevo («elementos importados» por defecto).</td></tr>
+  <tr><td><b>Acercar</b> / <b>Alejar</b> / <b>Restablecer zoom</b></td><td>Amplía o reduce toda la interfaz.</td></tr>
+  <tr><td><b>Actualizaciones</b></td><td>Muestra su versión y un enlace a la página de versiones.</td></tr>
+  <tr><td><b>Ayuda</b></td><td>Abre esta ventana.</td></tr>
+</table>
+
+<a name="saving"></a>
+<h2>Guardado y bloqueo automático</h2>
+<ul>
+  <li>Los cambios permanecen en memoria hasta que se guarda el perfil: con <b>Guardar</b> en la barra de herramientas,
+      <b>Ctrl+S</b>, o <b>Ctrl+K</b> (guardar y salir).</li>
+  <li>Al cerrar la ventana, bippass pregunta qué hacer con los cambios del elemento abierto
+      y después si desea guardar los cambios pendientes.</li>
+  <li>Tras un período de inactividad (ajustable en <b>Preferencias</b>), bippass aplica los cambios del elemento abierto,
+      guarda el perfil y se cierra. Si el guardado falla, la ventana permanece abierta.</li>
+  <li>Una vez cerrada la ventana, las contraseñas se borran de la memoria.</li>
+</ul>
+
+<a name="shortcuts"></a>
+<h2>Atajos de teclado</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Atajo</th><th>Acción</th></tr>
+  <tr><td><b>Ctrl+S</b></td><td>Guardar (en modo edición, también aplica los cambios del elemento)</td></tr>
+  <tr><td><b>Ctrl+K</b></td><td>Guardar y salir</td></tr>
+  <tr><td><b>Ctrl +</b> o <b>Ctrl =</b></td><td>Acercar</td></tr>
+  <tr><td><b>Ctrl -</b></td><td>Alejar</td></tr>
+  <tr><td><b>Ctrl 0</b></td><td>Restablecer zoom</td></tr>
+  <tr><td><b>Ctrl+A</b></td><td>Seleccionar todos los elementos de la lista (cuando la lista tiene el foco)</td></tr>
+  <tr><td><b>Ctrl+clic</b> / <b>Mayús+clic</b></td><td>Seleccionar varios elementos</td></tr>
+  <tr><td><b>Intro</b> o doble clic</td><td>Abrir el elemento seleccionado</td></tr>
+  <tr><td><b>Intro</b> en un cuadro de diálogo</td><td>Validar (Aceptar)</td></tr>
+</table>
+
+<a name="files"></a>
+<h2>Sus archivos</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Ubicación</th><th>Contenido</th></tr>
+  <tr><td><code>~/.bippass/profiles/&lt;nombre&gt;.encrypted</code></td><td>Sus perfiles. <b>Haga copias de seguridad de esta carpeta con regularidad.</b></td></tr>
+  <tr><td><code>~/.bippass/recent.json</code></td><td>El último perfil abierto.</td></tr>
+  <tr><td><code>~/.bippass/settings.json</code></td><td>El tema de la pantalla de inicio.</td></tr>
+</table>
+
+</body>
+</html>

@@ -17,4 +17,3 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 from .credentials_wizard import CredentialsWizard
-from .manager_window import PasswordManagerWindow

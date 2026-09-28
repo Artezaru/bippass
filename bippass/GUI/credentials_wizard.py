@@ -21,11 +21,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pyaescbc
-
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSlot
 from PyQt5.QtWidgets import (
-    QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -38,168 +35,208 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QRadioButton,
     QVBoxLayout,
+    QWidget,
     QWizard,
     QWizardPage,
 )
 
-from ..core.manager import PasswordManager
 from ..core.credentials import Credentials
-from ..core.types import Metadata
 from ..core.exceptions import (
+    CorruptedBase64Error,
     PrimaryPasswordError,
     SecondaryPasswordError,
-    CorruptedBase64Error,
 )
-from ..core.profiles import profile_path, list_existing_profiles
+from ..core.manager import PasswordManager
+from ..core.profiles import list_existing_profiles, profile_path
+from ..core.types import Metadata
+from .translate import translator
+from .widgets import LanguageComboBox, PasswordField
+from .window import PasswordManagerWindow
 
-from .manager_window import PasswordManagerWindow
-from .translate import translator, credentials_gui_translation, ENGLISH, FRENCH, SPANISH
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+WIZARD_TITLE = "BIPPASS"
+
+# Remembers the last vault file opened or created, to pre-fill the
+# first page.
+RECENT_FILE_PATH = Path.home() / ".bippass" / "recent.json"
+
+MODE_OPEN = "open"
+MODE_CREATE = "create"
+
+_NEW_PROFILE_FORMAT_VERSION = 1
+_PROFILES_LIST_MAX_HEIGHT_PX = 140
 
 
-def _t(key: str, **kwargs: str) -> str:
-    """Shorthand for ``translator.translate(key, credentials_gui_translation, **kwargs)``."""
-    return translator.translate(key, credentials_gui_translation, **kwargs)
-
-MEMORY_FILE_PATH = Path.home() / ".bippass" / "recent.json"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _load_last_file_path() -> Path | None:
     """
-    Return the last vault file path remembered in the memory file.
+    Return the last vault file opened or created.
 
     Returns
     -------
     Path or None
-        The remembered path, or ``None`` if there is no memory file
-        yet, or it cannot be read/parsed.
+        The remembered path, or ``None`` if nothing is remembered or
+        the file can't be read.
 
     Notes
     -----
-    Deliberately silent on any failure (missing file, corrupted JSON,
-    permission error): this is only a convenience pre-fill, never
-    something the rest of the app depends on.
+    Failures are silent: this is only a convenience pre-fill.
     """
     try:
-        raw = json.loads(MEMORY_FILE_PATH.read_text(encoding="utf-8"))
-        return Path(raw["last_file"])
-    except (OSError, KeyError, ValueError, json.JSONDecodeError):
+        recent = json.loads(RECENT_FILE_PATH.read_text(encoding="utf-8"))
+        return Path(recent["last_file"])
+    except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
 def _remember_file_path(path: Path) -> None:
     """
-    Record ``path`` as the last vault file opened or created.
+    Remember a vault file as the last one opened or created.
 
     Parameters
     ----------
     path : Path
-        Vault file path to remember for next time.
+        Vault file to remember.
 
     Notes
     -----
-    Best-effort: write failures (e.g. a read-only home directory) are
-    silently ignored, for the same reason as :func:`_load_last_file_path`.
+    Best effort: a write failure (e.g. read-only home folder) is
+    ignored.
     """
     try:
-        MEMORY_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MEMORY_FILE_PATH.write_text(
-            json.dumps({"last_file": str(path)}), encoding="utf-8",
-        )
+        RECENT_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RECENT_FILE_PATH.write_text(json.dumps({"last_file": str(path)}), encoding="utf-8")
     except OSError:
         pass
 
 
-def _build_language_combo(combo: QComboBox) -> None:
+def _warn(parent: QWidget, title_key: str, message: str) -> None:
     """
-    (Re)fill ``combo`` with the three supported languages, translated
-    to the current display language, keeping the current selection.
+    Show a warning message box.
 
-    Shared by every page that carries its own language switcher (here,
-    just :class:`_FilePage`), so they can't drift apart.
+    Parameters
+    ----------
+    parent : QWidget
+        Parent of the message box.
+    title_key : str
+        Translation key of the title.
+    message : str
+        Message, already translated.
     """
-    combo.blockSignals(True)
-    combo.clear()
-    combo.addItem(_t("language_en"), ENGLISH)
-    combo.addItem(_t("language_fr"), FRENCH)
-    combo.addItem(_t("language_es"), SPANISH)
-    combo.setCurrentIndex(combo.findData(translator.language))
-    combo.blockSignals(False)
+    QMessageBox.warning(parent, translator.translate(title_key), message)
+
+
+def _error(parent: QWidget, title_key: str, message: str) -> None:
+    """
+    Show an error message box.
+
+    Parameters
+    ----------
+    parent : QWidget
+        Parent of the message box.
+    title_key : str
+        Translation key of the title.
+    message : str
+        Message, already translated.
+    """
+    QMessageBox.critical(parent, translator.translate(title_key), message)
+
+
+def _unexpected_error(parent: QWidget, exc: Exception) -> None:
+    """
+    Show an unexpected error with its type.
+
+    Parameters
+    ----------
+    parent : QWidget
+        Parent of the message box.
+    exc : Exception
+        The error.
+    """
+    _error(
+        parent,
+        "wizard.unexpected_error_title",
+        translator.translate(
+            "wizard.unexpected_error_message", error_type=type(exc).__name__, error=str(exc)
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Unlock / create wizard
+# Pages
 # ---------------------------------------------------------------------------
 
 class _FilePage(QWizardPage):
     """
-    Step 1: the launch screen -- pick an existing profile or vault
-    file to open, or choose a username for a new profile. Also carries
-    the wizard's language switcher (see :attr:`language_combo`), since
-    this is the very first thing shown.
+    Step 1: pick a profile or vault file to open, or a username for a
+    new profile. Also holds the wizard's language switcher.
 
-    Builds the :class:`PasswordManager` for the rest of the wizard,
-    with an empty :class:`Credentials` instance that the next two
-    pages fill in, but does not decrypt or authenticate anything yet.
+    Builds the wizard's :class:`PasswordManager` with empty
+    :class:`Credentials`, filled by the next two pages; nothing is
+    decrypted yet.
+
+    Parameters
+    ----------
+    parent : QWidget, optional
+        Parent widget.
 
     Notes
     -----
-    A "profile" is simply a vault file living at the well-known
-    location ``~/bippass/<username>.encrypted`` (see
-    :mod:`core.profiles`). In OPEN mode, this page lists every such
-    profile currently on disk as one-click choices, alongside a
-    "Browse..." option for a vault file stored elsewhere. In CREATE
-    mode, only a username is asked for: the destination is always
-    ``~/bippass/<username>.encrypted``, and creation is refused if a
-    profile with that username already exists -- there is no manual
-    "choose where to save" step anymore, and no silent overwrite.
+    A profile is a vault file at ``~/.bippass/profiles/<username>.encrypted``
+    (see :mod:`core.profiles`). Opening lists the existing profiles
+    and allows browsing for a file stored elsewhere; creating only asks
+    for a username and refuses one that is already taken.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-
         layout = QVBoxLayout(self)
 
-        top_layout = QHBoxLayout()
-        mode_layout = QHBoxLayout()
+        top_row = QHBoxLayout()
         self.open_radio = QRadioButton()
         self.create_radio = QRadioButton()
         self.open_radio.setChecked(True)
         self.open_radio.toggled.connect(self._on_mode_changed)
-        mode_layout.addWidget(self.open_radio)
-        mode_layout.addWidget(self.create_radio)
-        top_layout.addLayout(mode_layout)
-        top_layout.addStretch()
+        top_row.addWidget(self.open_radio)
+        top_row.addWidget(self.create_radio)
+        top_row.addStretch()
 
         self.language_label = QLabel()
-        self.language_combo = QComboBox()
+        self.language_combo = LanguageComboBox()
         self.language_combo.currentIndexChanged.connect(self._on_language_changed)
-        top_layout.addWidget(self.language_label)
-        top_layout.addWidget(self.language_combo)
-        layout.addLayout(top_layout)
+        top_row.addWidget(self.language_label)
+        top_row.addWidget(self.language_combo)
+        layout.addLayout(top_row)
 
-        # -- OPEN mode: existing profiles, or browse for a file ------------
-
+        # Open mode: existing profiles, or any vault file
         self.profiles_label = QLabel()
         layout.addWidget(self.profiles_label)
 
         self.profiles_list = QListWidget()
-        self.profiles_list.setMaximumHeight(140)
+        self.profiles_list.setMaximumHeight(_PROFILES_LIST_MAX_HEIGHT_PX)
         self.profiles_list.itemClicked.connect(self._on_profile_clicked)
         layout.addWidget(self.profiles_list)
 
         self.browse_label = QLabel()
         layout.addWidget(self.browse_label)
 
-        file_layout = QHBoxLayout()
+        file_row = QHBoxLayout()
         self.file_edit = QLineEdit()
-        self.file_edit.textEdited.connect(self._on_file_edited)
+        self.file_edit.textEdited.connect(self.profiles_list.clearSelection)
         self.browse_button = QPushButton()
         self.browse_button.clicked.connect(self._browse)
-        file_layout.addWidget(self.file_edit)
-        file_layout.addWidget(self.browse_button)
-        layout.addLayout(file_layout)
+        file_row.addWidget(self.file_edit)
+        file_row.addWidget(self.browse_button)
+        layout.addLayout(file_row)
 
-        # -- CREATE mode: username only (destination is derived) -----------
-
+        # Create mode: username only, the file path is derived from it
         self.username_label = QLabel()
         self.username_edit = QLineEdit()
         self.username_edit.textChanged.connect(self._update_destination_label)
@@ -210,500 +247,629 @@ class _FilePage(QWizardPage):
         self.destination_label.setObjectName("mutedLabel")
         self.destination_label.setWordWrap(True)
         layout.addWidget(self.destination_label)
-
         layout.addStretch()
 
-        _build_language_combo(self.language_combo)
-        self._retranslate_ui()
+        self.retranslate()
+        translator.language_changed.connect(self.retranslate)
 
     def initializePage(self) -> None:
+        """List the profiles on disk and pre-fill the last file opened."""
         self._refresh_profiles_list()
         if self.open_radio.isChecked() and not self.file_edit.text():
             last_path = _load_last_file_path()
             if last_path is not None:
                 self.file_edit.setText(str(last_path))
 
-    def _refresh_profiles_list(self) -> None:
-        """(Re)populate :attr:`profiles_list` from what's currently on disk."""
-        self.profiles_list.clear()
-        for username in list_existing_profiles():
-            item = QListWidgetItem(username)
-            item.setData(Qt.UserRole, str(profile_path(username)))
-            self.profiles_list.addItem(item)
-
-    def _on_profile_clicked(self, item: QListWidgetItem) -> None:
-        """Fill the file field from a clicked profile row."""
-        self.file_edit.setText(item.data(Qt.UserRole))
-
-    def _on_file_edited(self, _text: str) -> None:
-        """A manual edit to the file field no longer matches a profile row."""
-        self.profiles_list.clearSelection()
-
-    def _on_language_changed(self, index: int) -> None:
-        """Switch the display language and retranslate the whole wizard."""
-        language = self.language_combo.itemData(index)
-        if language is None or language == translator.language:
-            return
-        translator.set_language(language)
-        wizard = self.wizard()
-        if wizard is not None:
-            wizard.retranslate_all()
-
-    def _on_mode_changed(self) -> None:
-        creating = self.create_radio.isChecked()
-        self.setSubTitle(
-            _t("file_page_subtitle_create") if creating
-            else _t("file_page_subtitle_open")
-        )
-
-        self.profiles_label.setVisible(not creating)
-        self.profiles_list.setVisible(not creating)
-        self.browse_label.setVisible(not creating)
-        self.file_edit.setVisible(not creating)
-        self.browse_button.setVisible(not creating)
-
-        self.username_label.setVisible(creating)
-        self.username_edit.setVisible(creating)
-        self.destination_label.setVisible(creating)
-        if creating:
-            self._update_destination_label()
-
-    def _update_destination_label(self) -> None:
-        """Show where a new profile would be saved, as the username is typed."""
-        username = self.username_edit.text().strip()
-        if not username:
-            self.destination_label.setText("")
-            return
-        self.destination_label.setText(_t("destination_label", path=str(profile_path(username))))
-
-    def _retranslate_ui(self) -> None:
-        """Refresh every translated string on this page after a language change."""
-        self.setTitle(_t("file_page_title"))
-        self.open_radio.setText(_t("open_radio"))
-        self.create_radio.setText(_t("create_radio"))
-
-        self.language_label.setText(_t("language_label"))
-        _build_language_combo(self.language_combo)
-
-        self.profiles_label.setText(_t("existing_profiles_label"))
-        self.browse_label.setText(_t("browse_label"))
-        self.file_edit.setPlaceholderText(_t("file_path_placeholder"))
-        self.browse_button.setText(_t("browse_button"))
-
-        self.username_label.setText(_t("username_label"))
-        self._update_destination_label()
-
+    @pyqtSlot()
+    def retranslate(self) -> None:
+        """Refresh every text of the page."""
+        tr = translator.translate
+        self.setTitle(tr("wizard.file_page_title"))
+        self.open_radio.setText(tr("wizard.open_radio"))
+        self.create_radio.setText(tr("wizard.create_radio"))
+        self.language_label.setText(tr("wizard.language_label"))
+        self.profiles_label.setText(tr("wizard.existing_profiles_label"))
+        self.browse_label.setText(tr("wizard.browse_label"))
+        self.file_edit.setPlaceholderText(tr("wizard.file_path_placeholder"))
+        self.browse_button.setText(tr("common.browse"))
+        self.username_label.setText(tr("common.username_label"))
         self._on_mode_changed()
 
+    def _refresh_profiles_list(self) -> None:
+        """Fill :attr:`profiles_list` with the profiles currently on disk."""
+        self.profiles_list.clear()
+        for username in list_existing_profiles():
+            row = QListWidgetItem(username)
+            row.setData(Qt.UserRole, str(profile_path(username)))
+            self.profiles_list.addItem(row)
+
+    def _on_profile_clicked(self, row: QListWidgetItem) -> None:
+        """
+        Fill the file field with a clicked profile's file.
+
+        Parameters
+        ----------
+        row : QListWidgetItem
+            The clicked profile row.
+        """
+        self.file_edit.setText(row.data(Qt.UserRole))
+
+    def _on_language_changed(self) -> None:
+        """Switch the display language to the one picked."""
+        translator.set_language(self.language_combo.language())
+
+    def _is_creating(self) -> bool:
+        """
+        Tell whether a new profile is being created.
+
+        Returns
+        -------
+        bool
+            ``True`` in create mode, ``False`` in open mode.
+        """
+        return self.create_radio.isChecked()
+
+    def _on_mode_changed(self) -> None:
+        """Show the widgets and subtitle of the selected mode."""
+        creating = self._is_creating()
+        self.setSubTitle(
+            translator.translate(
+                "wizard.file_page_subtitle_create" if creating else "wizard.file_page_subtitle_open"
+            )
+        )
+        for widget in (
+            self.profiles_label,
+            self.profiles_list,
+            self.browse_label,
+            self.file_edit,
+            self.browse_button,
+        ):
+            widget.setVisible(not creating)
+        for widget in (self.username_label, self.username_edit, self.destination_label):
+            widget.setVisible(creating)
+        self._update_destination_label()
+
+    def _update_destination_label(self) -> None:
+        """Show where the new profile will be saved, as the username is typed."""
+        username = self.username_edit.text().strip()
+        self.destination_label.setText(
+            translator.translate("wizard.destination_label", path=str(profile_path(username)))
+            if username
+            else ""
+        )
+
     def _browse(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(
-            self, _t("select_vault_file_dialog_title"), "",
-            _t("vault_files_filter"),
+        """Pick a vault file, starting next to the current one or in the home folder."""
+        current = Path(self.file_edit.text().strip() or Path.home())
+        start = current.parent if current.is_file() else Path.home()
+        filename, _filter = QFileDialog.getOpenFileName(
+            self,
+            translator.translate("wizard.select_vault_file_dialog_title"),
+            str(start),
+            translator.translate("common.vault_files_filter"),
         )
         if filename:
             self.file_edit.setText(filename)
             self.profiles_list.clearSelection()
 
     def validatePage(self) -> bool:
+        """
+        Prepare the wizard's manager for the selected mode.
+
+        Returns
+        -------
+        bool
+            ``True`` to go on to the next page, ``False`` after an
+            error message.
+        """
         wizard: CredentialsWizard = self.wizard()
+        if self._is_creating():
+            return self._prepare_new_profile(wizard)
+        return self._prepare_existing_file(wizard)
 
-        if self.create_radio.isChecked():
-            return self._create_manager(wizard)
-        return self._open_manager(wizard)
+    def _prepare_new_profile(self, wizard: CredentialsWizard) -> bool:
+        """
+        Build an empty manager for a new profile.
 
-    def _create_manager(self, wizard: 'CredentialsWizard') -> bool:
+        Parameters
+        ----------
+        wizard : CredentialsWizard
+            The wizard, receiving the mode, file path and manager.
+
+        Returns
+        -------
+        bool
+            ``False`` if the username is empty or taken, or the
+            profiles folder can't be created.
+
+        Notes
+        -----
+        The new profile starts in the language chosen in the wizard.
+        """
         username = self.username_edit.text().strip()
         if not username:
-            QMessageBox.warning(self, _t("missing_username_title"), _t("missing_username_message"))
+            _warn(
+                self,
+                "wizard.missing_username_title",
+                translator.translate("wizard.missing_username_message"),
+            )
             return False
 
         path = profile_path(username)
         if path.exists():
-            QMessageBox.warning(
-                self, _t("profile_exists_title"),
-                _t("profile_exists_message", username=username),
+            _warn(
+                self,
+                "wizard.profile_exists_title",
+                translator.translate("wizard.profile_exists_message", username=username),
             )
             return False
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            QMessageBox.critical(
-                self, _t("folder_error_title"),
-                _t("folder_error_message", error=exc),
+            _error(
+                self,
+                "wizard.folder_error_title",
+                translator.translate("wizard.folder_error_message", error=str(exc)),
             )
             return False
 
-        metadata: Metadata = {
-            "username": username,
-            "version": 1,
-        }
-
-        wizard.mode = "create"
-        wizard.file_path = path
-        wizard.credentials = Credentials()
+        metadata: Metadata = {"username": username, "version": _NEW_PROFILE_FORMAT_VERSION}
+        credentials = Credentials()
         try:
-            wizard.manager = PasswordManager.new(metadata, wizard.credentials)
+            manager = PasswordManager.new(metadata, credentials)
+            manager.set_language(translator.language)
         except Exception as exc:
-            QMessageBox.critical(
-                self, _t("unexpected_error_title"),
-                _t("unexpected_error_message", error_type=type(exc).__name__, error=exc),
-            )
+            _unexpected_error(self, exc)
             return False
+
+        wizard.start(MODE_CREATE, path, manager, credentials)
         return True
 
-    def _open_manager(self, wizard: 'CredentialsWizard') -> bool:
+    def _prepare_existing_file(self, wizard: CredentialsWizard) -> bool:
+        """
+        Read an existing vault file into a still-locked manager.
+
+        Parameters
+        ----------
+        wizard : CredentialsWizard
+            The wizard, receiving the mode, file path and manager.
+
+        Returns
+        -------
+        bool
+            ``False`` if no file is given, it doesn't exist or can't be
+            read.
+        """
         path_text = self.file_edit.text().strip()
         if not path_text:
-            QMessageBox.warning(self, _t("missing_file_title"), _t("missing_file_message"))
+            _warn(
+                self,
+                "wizard.missing_file_title",
+                translator.translate("wizard.missing_file_message"),
+            )
             return False
-        path = Path(path_text)
 
+        path = Path(path_text)
         if not path.is_file():
-            QMessageBox.warning(
-                self, _t("file_not_found_title"),
-                _t("file_not_found_message", path=str(path)),
+            _warn(
+                self,
+                "wizard.file_not_found_title",
+                translator.translate("wizard.file_not_found_message", path=str(path)),
             )
             return False
 
         try:
             data = bytearray(path.read_bytes())
         except OSError as exc:
-            QMessageBox.critical(
-                self, _t("read_error_title"),
-                _t("read_error_message", error=exc),
+            _error(
+                self,
+                "wizard.read_error_title",
+                translator.translate("wizard.read_error_message", error=str(exc)),
             )
             return False
 
-        wizard.mode = "open"
-        wizard.file_path = path
-        wizard.credentials = Credentials()
-        wizard.manager = PasswordManager(data, wizard.credentials)
+        credentials = Credentials()
+        try:
+            manager = PasswordManager(data, credentials)
+        except Exception as exc:
+            _unexpected_error(self, exc)
+            return False
+
+        wizard.start(MODE_OPEN, path, manager, credentials)
         return True
 
 
-class _PrimaryPage(QWizardPage):
+class _PasswordPage(QWizardPage):
     """
-    Step 2: primary password.
- 
-    In "open" mode, entering it attempts
-    :meth:`PasswordManager.decrypt_data`; a wrong password keeps the
-    user on this page. In "create" mode, it is simply recorded (with
-    a confirmation field) as the new vault's primary password.
+    Base of the steps asking for one password: entered to unlock an
+    existing vault, or chosen (with a confirmation) for a new one.
+
+    Subclasses set the translation keys and implement
+    :meth:`_apply_create` and :meth:`_apply_open`.
+
+    Parameters
+    ----------
+    parent : QWidget, optional
+        Parent widget.
     """
- 
+
+    _title_key = ""
+    _subtitle_create_key = ""
+    _subtitle_open_key = ""
+
     def __init__(self, parent=None):
         super().__init__(parent)
- 
         layout = QFormLayout(self)
- 
+
         self.password_label = QLabel()
-        self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.Password)
-        self.password_toggle_btn = QPushButton()
-        self.password_toggle_btn.setObjectName("smallButton")
-        self.password_toggle_btn.clicked.connect(self._toggle_password_mask)
-        password_row = QHBoxLayout()
-        password_row.addWidget(self.password_edit)
-        password_row.addWidget(self.password_toggle_btn)
-        layout.addRow(self.password_label, password_row)
- 
-        self.confirm_password_label = QLabel()
-        self.confirm_password_edit = QLineEdit()
-        self.confirm_password_edit.setEchoMode(QLineEdit.Password)
-        self.confirm_password_toggle_btn = QPushButton()
-        self.confirm_password_toggle_btn.setObjectName("smallButton")
-        self.confirm_password_toggle_btn.clicked.connect(self._toggle_confirm_password_mask)
-        confirm_password_row = QHBoxLayout()
-        confirm_password_row.addWidget(self.confirm_password_edit)
-        confirm_password_row.addWidget(self.confirm_password_toggle_btn)
-        layout.addRow(self.confirm_password_label, confirm_password_row)
- 
-        self._retranslate_ui()
- 
+        self.password_field = PasswordField()
+        layout.addRow(self.password_label, self.password_field)
+
+        self.confirm_label = QLabel()
+        self.confirm_field = PasswordField()
+        layout.addRow(self.confirm_label, self.confirm_field)
+
+        self.retranslate()
+        translator.language_changed.connect(self.retranslate)
+
+    def _is_creating(self) -> bool:
+        """
+        Tell whether the wizard creates a new profile.
+
+        Returns
+        -------
+        bool
+            ``True`` in create mode; ``False`` in open mode, or before
+            the page is added to the wizard.
+        """
+        wizard = self.wizard()
+        return wizard is not None and wizard.mode == MODE_CREATE
+
     def initializePage(self) -> None:
-        self._update_mode_texts()
- 
-    def _toggle_password_mask(self) -> None:
-        masked = self.password_edit.echoMode() == QLineEdit.Password
-        self.password_edit.setEchoMode(QLineEdit.Normal if masked else QLineEdit.Password)
-        self.password_toggle_btn.setText(_t("hide" if masked else "show"))
- 
-    def _toggle_confirm_password_mask(self) -> None:
-        masked = self.confirm_password_edit.echoMode() == QLineEdit.Password
-        self.confirm_password_edit.setEchoMode(QLineEdit.Normal if masked else QLineEdit.Password)
-        self.confirm_password_toggle_btn.setText(_t("hide" if masked else "show"))
- 
-    def _update_mode_texts(self) -> None:
-        creating = self.wizard().mode == "create"
+        """Adapt the subtitle and confirmation field to the wizard's mode."""
+        self._update_mode()
+
+    @pyqtSlot()
+    def retranslate(self) -> None:
+        """Refresh every text of the page."""
+        self.setTitle(translator.translate(self._title_key))
+        self.password_label.setText(translator.translate("wizard.password_label"))
+        self.confirm_label.setText(translator.translate("wizard.confirm_password_label"))
+        self._update_mode()
+
+    def _update_mode(self) -> None:
+        """Show the subtitle of the mode, and the confirmation field when creating."""
+        creating = self._is_creating()
         self.setSubTitle(
-            _t("primary_subtitle_create") if creating else _t("primary_subtitle_open")
+            translator.translate(self._subtitle_create_key if creating else self._subtitle_open_key)
         )
-        self.confirm_password_label.setVisible(creating)
-        self.confirm_password_edit.setVisible(creating)
-        self.confirm_password_toggle_btn.setVisible(creating)
- 
-    def _retranslate_ui(self) -> None:
-        """Refresh every translated string on this page after a language change."""
-        self.setTitle(_t("primary_page_title"))
-        self.password_label.setText(_t("password_label"))
-        self.confirm_password_label.setText(_t("confirm_password_label"))
-        self.password_toggle_btn.setToolTip(_t("show_hide_tooltip"))
-        self.password_toggle_btn.setText(
-            _t("hide" if self.password_edit.echoMode() == QLineEdit.Normal else "show")
-        )
-        self.confirm_password_toggle_btn.setToolTip(_t("show_hide_tooltip"))
-        self.confirm_password_toggle_btn.setText(
-            _t("hide" if self.confirm_password_edit.echoMode() == QLineEdit.Normal else "show")
-        )
-        # `self.wizard()` is still None at construction time (before
-        # `addPage` inserts this page into the wizard), and
-        # `_update_mode_texts` needs `wizard().mode`: skip it then --
-        # `initializePage` (called by Qt right before this page is
-        # actually shown) runs it with a real wizard in place.
-        if self.wizard() is not None:
-            self._update_mode_texts()
- 
+        self.confirm_label.setVisible(creating)
+        self.confirm_field.setVisible(creating)
+
     def validatePage(self) -> bool:
-        wizard: CredentialsWizard = self.wizard()
-        password = self.password_edit.text()
- 
+        """
+        Check the password, then apply it for the wizard's mode.
+
+        Returns
+        -------
+        bool
+            ``True`` to go on, ``False`` after an error message.
+        """
+        password = self.password_field.text()
         if not password:
-            QMessageBox.warning(self, _t("missing_fields_title"), _t("missing_fields_message"))
+            _warn(
+                self,
+                "wizard.missing_fields_title",
+                translator.translate("wizard.missing_fields_message"),
+            )
             return False
- 
-        if wizard.mode == "create":
-            if password != self.confirm_password_edit.text():
-                QMessageBox.warning(self, _t("mismatch_title"), _t("mismatch_message"))
-                return False
-            wizard.credentials.set_primary_password(bytearray(password.encode("utf-8")))
-            return True
- 
-        # Open mode: try to actually decrypt with this password.
-        wizard.credentials.set_primary_password(bytearray(password.encode("utf-8")))
+
+        wizard: CredentialsWizard = self.wizard()
+        if not self._is_creating():
+            return self._apply_open(wizard, self.password_field.to_bytearray())
+
+        if password != self.confirm_field.text():
+            _warn(self, "wizard.mismatch_title", translator.translate("wizard.mismatch_message"))
+            return False
+        return self._apply_create(wizard, self.password_field.to_bytearray())
+
+    def clear(self) -> None:
+        """Erase the entered passwords."""
+        self.password_field.clear()
+        self.confirm_field.clear()
+
+    def _apply_create(self, wizard: CredentialsWizard, password: bytearray) -> bool:
+        """
+        Use a chosen password for the new profile.
+
+        Parameters
+        ----------
+        wizard : CredentialsWizard
+            The wizard.
+        password : bytearray
+            The confirmed password.
+
+        Returns
+        -------
+        bool
+            ``True`` to go on.
+        """
+        raise NotImplementedError
+
+    def _apply_open(self, wizard: CredentialsWizard, password: bytearray) -> bool:
+        """
+        Check an entered password against the opened vault.
+
+        Parameters
+        ----------
+        wizard : CredentialsWizard
+            The wizard.
+        password : bytearray
+            The entered password.
+
+        Returns
+        -------
+        bool
+            ``True`` if the password is right.
+        """
+        raise NotImplementedError
+
+
+class _PrimaryPage(_PasswordPage):
+    """
+    Step 2: the primary password, which decrypts the vault file.
+
+    Parameters
+    ----------
+    parent : QWidget, optional
+        Parent widget.
+    """
+
+    _title_key = "wizard.primary_page_title"
+    _subtitle_create_key = "wizard.primary_subtitle_create"
+    _subtitle_open_key = "wizard.primary_subtitle_open"
+
+    def _apply_create(self, wizard: CredentialsWizard, password: bytearray) -> bool:
+        """
+        Record the primary password of the new profile.
+
+        Parameters
+        ----------
+        wizard : CredentialsWizard
+            The wizard.
+        password : bytearray
+            The confirmed password.
+
+        Returns
+        -------
+        bool
+            Always ``True``.
+        """
+        wizard.credentials.set_primary_password(password)
+        return True
+
+    def _apply_open(self, wizard: CredentialsWizard, password: bytearray) -> bool:
+        """
+        Decrypt the vault with the entered primary password.
+
+        Parameters
+        ----------
+        wizard : CredentialsWizard
+            The wizard.
+        password : bytearray
+            The entered password.
+
+        Returns
+        -------
+        bool
+            ``False`` if the password is wrong or the vault invalid.
+        """
+        wizard.credentials.set_primary_password(password)
         try:
             wizard.manager.decrypt_data()
         except PrimaryPasswordError:
-            QMessageBox.critical(
-                self, _t("wrong_credentials_title"),
-                _t("wrong_primary_credentials_message"),
+            _error(
+                self,
+                "wizard.wrong_credentials_title",
+                translator.translate("wizard.wrong_primary_credentials_message"),
             )
             return False
         except ValueError as exc:
-            QMessageBox.critical(
-                self, _t("invalid_vault_title"),
-                _t("invalid_vault_message", error=exc),
+            _error(
+                self,
+                "wizard.invalid_vault_title",
+                translator.translate("wizard.invalid_vault_message", error=str(exc)),
             )
             return False
         except Exception as exc:
-            QMessageBox.critical(
-                self, _t("unexpected_error_title"),
-                _t("unexpected_error_message", error_type=type(exc).__name__, error=exc),
-            )
+            _unexpected_error(self, exc)
             return False
         return True
- 
- 
-class _SecondaryPage(QWizardPage):
+
+
+class _SecondaryPage(_PasswordPage):
     """
-    Step 3: secondary password.
- 
-    In "open" mode, entering it attempts
-    :meth:`PasswordManager.check_secondary`; a wrong password keeps
-    the user on this page. In "create" mode, it is recorded (with
-    confirmation fields), and the brand-new vault is written to disk
-    right away via :meth:`PasswordManager.save_changes`, so nothing is
-    lost even if the app closes before the user explicitly saves again.
+    Step 3: the secondary password, which encrypts individual secrets.
+
+    When creating, the new vault is written to disk right away, so
+    nothing is lost if the application closes before the next save.
+
+    Parameters
+    ----------
+    parent : QWidget, optional
+        Parent widget.
     """
- 
-    def __init__(self, parent=None):
-        super().__init__(parent)
- 
-        layout = QFormLayout(self)
- 
-        self.password_label = QLabel()
-        self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.Password)
-        self.password_toggle_btn = QPushButton()
-        self.password_toggle_btn.setObjectName("smallButton")
-        self.password_toggle_btn.clicked.connect(self._toggle_password_mask)
-        password_row = QHBoxLayout()
-        password_row.addWidget(self.password_edit)
-        password_row.addWidget(self.password_toggle_btn)
-        layout.addRow(self.password_label, password_row)
- 
-        self.confirm_password_label = QLabel()
-        self.confirm_password_edit = QLineEdit()
-        self.confirm_password_edit.setEchoMode(QLineEdit.Password)
-        self.confirm_password_toggle_btn = QPushButton()
-        self.confirm_password_toggle_btn.setObjectName("smallButton")
-        self.confirm_password_toggle_btn.clicked.connect(self._toggle_confirm_password_mask)
-        confirm_password_row = QHBoxLayout()
-        confirm_password_row.addWidget(self.confirm_password_edit)
-        confirm_password_row.addWidget(self.confirm_password_toggle_btn)
-        layout.addRow(self.confirm_password_label, confirm_password_row)
- 
-        self._retranslate_ui()
- 
-    def initializePage(self) -> None:
-        self._update_mode_texts()
- 
-    def _toggle_password_mask(self) -> None:
-        masked = self.password_edit.echoMode() == QLineEdit.Password
-        self.password_edit.setEchoMode(QLineEdit.Normal if masked else QLineEdit.Password)
-        self.password_toggle_btn.setText(_t("hide" if masked else "show"))
- 
-    def _toggle_confirm_password_mask(self) -> None:
-        masked = self.confirm_password_edit.echoMode() == QLineEdit.Password
-        self.confirm_password_edit.setEchoMode(QLineEdit.Normal if masked else QLineEdit.Password)
-        self.confirm_password_toggle_btn.setText(_t("hide" if masked else "show"))
- 
-    def _update_mode_texts(self) -> None:
-        creating = self.wizard().mode == "create"
-        self.setSubTitle(
-            _t("secondary_subtitle_create") if creating else _t("secondary_subtitle_open")
-        )
-        self.confirm_password_label.setVisible(creating)
-        self.confirm_password_edit.setVisible(creating)
-        self.confirm_password_toggle_btn.setVisible(creating)
- 
-    def _retranslate_ui(self) -> None:
-        """Refresh every translated string on this page after a language change."""
-        self.setTitle(_t("secondary_page_title"))
-        self.password_label.setText(_t("password_label"))
-        self.confirm_password_label.setText(_t("confirm_password_label"))
-        self.password_toggle_btn.setToolTip(_t("show_hide_tooltip"))
-        self.password_toggle_btn.setText(
-            _t("hide" if self.password_edit.echoMode() == QLineEdit.Normal else "show")
-        )
-        self.confirm_password_toggle_btn.setToolTip(_t("show_hide_tooltip"))
-        self.confirm_password_toggle_btn.setText(
-            _t("hide" if self.confirm_password_edit.echoMode() == QLineEdit.Normal else "show")
-        )
-        # See the identical guard/comment in `_PrimaryPage._retranslate_ui`.
-        if self.wizard() is not None:
-            self._update_mode_texts()
- 
-    def validatePage(self) -> bool:
-        wizard: CredentialsWizard = self.wizard()
-        password = self.password_edit.text()
- 
-        if not password:
-            QMessageBox.warning(self, _t("missing_fields_title"), _t("missing_fields_message"))
+
+    _title_key = "wizard.secondary_page_title"
+    _subtitle_create_key = "wizard.secondary_subtitle_create"
+    _subtitle_open_key = "wizard.secondary_subtitle_open"
+
+    def _apply_create(self, wizard: CredentialsWizard, password: bytearray) -> bool:
+        """
+        Record the secondary password and write the new vault.
+
+        Parameters
+        ----------
+        wizard : CredentialsWizard
+            The wizard.
+        password : bytearray
+            The confirmed password.
+
+        Returns
+        -------
+        bool
+            ``False`` if the vault file can't be written.
+        """
+        wizard.credentials.set_secondary_password(password)
+        try:
+            wizard.manager.save_changes(wizard.file_path)
+        except OSError as exc:
+            _error(
+                self,
+                "wizard.write_error_title",
+                translator.translate("wizard.write_error_message", error=str(exc)),
+            )
             return False
- 
-        if wizard.mode == "create":
-            if password != self.confirm_password_edit.text():
-                QMessageBox.warning(self, _t("mismatch_title"), _t("mismatch_message"))
-                return False
-            wizard.credentials.set_secondary_password(bytearray(password.encode("utf-8")))
-            try:
-                wizard.manager.save_changes(wizard.file_path)
-            except OSError as exc:
-                QMessageBox.critical(
-                    self, _t("write_error_title"),
-                    _t("write_error_message", error=exc),
-                )
-                return False
-            _remember_file_path(wizard.file_path)
-            return True
- 
-        # Open mode: try to actually validate this password.
-        wizard.credentials.set_secondary_password(bytearray(password.encode("utf-8")))
+        except Exception as exc:
+            _unexpected_error(self, exc)
+            return False
+        _remember_file_path(wizard.file_path)
+        return True
+
+    def _apply_open(self, wizard: CredentialsWizard, password: bytearray) -> bool:
+        """
+        Check the entered secondary password against the vault.
+
+        Parameters
+        ----------
+        wizard : CredentialsWizard
+            The wizard.
+        password : bytearray
+            The entered password.
+
+        Returns
+        -------
+        bool
+            ``False`` if the password is wrong or the vault corrupted.
+        """
+        wizard.credentials.set_secondary_password(password)
         try:
             wizard.manager.check_secondary()
         except SecondaryPasswordError:
-            QMessageBox.critical(
-                self, _t("wrong_credentials_title"),
-                _t("wrong_secondary_credentials_message"),
+            _error(
+                self,
+                "wizard.wrong_credentials_title",
+                translator.translate("wizard.wrong_secondary_credentials_message"),
             )
             return False
         except CorruptedBase64Error:
-            QMessageBox.critical(
-                self, _t("corrupted_vault_title"),
-                _t("corrupted_vault_message"),
+            _error(
+                self,
+                "wizard.corrupted_vault_title",
+                translator.translate("wizard.corrupted_vault_message"),
             )
             return False
         except Exception as exc:
-            QMessageBox.critical(
-                self, _t("unexpected_error_title"),
-                _t("unexpected_error_message", error_type=type(exc).__name__, error=exc),
-            )
+            _unexpected_error(self, exc)
             return False
- 
         _remember_file_path(wizard.file_path)
         return True
 
 
+# ---------------------------------------------------------------------------
+# Wizard
+# ---------------------------------------------------------------------------
+
 class CredentialsWizard(QWizard):
     """
-    Three-step wizard to open an existing vault or create a new one.
+    Three-step wizard opening an existing vault or creating a new one:
 
-    1. :class:`_FilePage`, the launch screen: pick an existing
-       profile (or browse for a vault file stored elsewhere) to open,
-       or choose a username for a new profile -- saved at
-       ``~/bippass/<username>.encrypted`` -- and build an inert
-       :class:`PasswordManager` with an empty :class:`Credentials`.
-       Also carries the wizard's language switcher.
+    1. :class:`_FilePage`: the profile or file to open, or the
+       username of a new profile;
+    2. :class:`_PrimaryPage`: the primary password;
+    3. :class:`_SecondaryPage`: the secondary password.
 
-    2. :class:`_PrimaryPage`, enter (open) or choose (create) the
-       primary password.
+    On success, the wizard opens the :class:`PasswordManagerWindow`
+    itself.
 
-    3. :class:`_SecondaryPage`, enter (open) or choose (create) the
-       secondary password.
-
-    On success, opens the main :class:`PasswordManagerWindow` itself
-    (see :attr:`window`) rather than leaving that to the caller.
+    Parameters
+    ----------
+    parent : QWidget, optional
+        Parent widget.
 
     Attributes
     ----------
     mode : str
-        ``"open"`` or ``"create"``, set by :class:`_FilePage`.
-
+        :data:`MODE_OPEN` or :data:`MODE_CREATE`, set by the first page.
     file_path : Path or None
-        The vault file being opened or created.
-
+        The vault file opened or created.
     credentials : Credentials
-        Shared, filled in progressively by pages 2 and 3.
-
+        Filled by the password pages.
     manager : PasswordManager or None
-        Built by :class:`_FilePage`; fully usable once all three
-        pages have completed.
-
-    window : PasswordManagerWindow or None
-        The main window opened on success. Kept as an attribute so it
-        is not garbage-collected once the wizard itself closes.
+        Built by the first page, usable once every page is done.
+    main_window : PasswordManagerWindow or None
+        The window opened on success, kept so it isn't garbage
+        collected once the wizard closes.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("BIPPASS")
+        self.setWindowTitle(WIZARD_TITLE)
         self.setOption(QWizard.NoBackButtonOnStartPage, True)
 
-        self.mode: str = "open"
+        self.mode = MODE_OPEN
         self.file_path: Path | None = None
-        self.credentials: Credentials = Credentials()
+        self.credentials = Credentials()
         self.manager: PasswordManager | None = None
-        self.window: PasswordManagerWindow | None = None
+        self.main_window: PasswordManagerWindow | None = None
 
-        self._file_page = _FilePage(self)
-        self._primary_page = _PrimaryPage(self)
-        self._secondary_page = _SecondaryPage(self)
-
-        self.addPage(self._file_page)
-        self.addPage(self._primary_page)
-        self.addPage(self._secondary_page)
+        self._password_pages = (_PrimaryPage(self), _SecondaryPage(self))
+        self.addPage(_FilePage(self))
+        for page in self._password_pages:
+            self.addPage(page)
 
         self.finished.connect(self._on_finished)
 
-    def retranslate_all(self) -> None:
-        """Refresh every translated string on every page, e.g. after a language change."""
-        self._file_page._retranslate_ui()
-        self._primary_page._retranslate_ui()
-        self._secondary_page._retranslate_ui()
+    def start(
+        self,
+        mode: str,
+        file_path: Path,
+        manager: PasswordManager,
+        credentials: Credentials,
+    ) -> None:
+        """
+        Record the vault chosen on the first page.
+
+        Parameters
+        ----------
+        mode : str
+            :data:`MODE_OPEN` or :data:`MODE_CREATE`.
+        file_path : Path
+            The vault file.
+        manager : PasswordManager
+            Manager built for that file, still locked.
+        credentials : Credentials
+            Empty credentials shared with ``manager``, filled by the
+            password pages.
+        """
+        self.mode = mode
+        self.file_path = file_path
+        self.manager = manager
+        self.credentials = credentials
 
     def _on_finished(self, result: int) -> None:
+        """
+        Erase the typed passwords and, on success, open the main window.
+
+        Parameters
+        ----------
+        result : int
+            ``QDialog.Accepted`` if every page was completed.
+        """
+        for page in self._password_pages:
+            page.clear()
         if result != QDialog.Accepted:
             return
-        self.window = PasswordManagerWindow(self.manager, self.file_path)
-        self.window.show()
+        self.main_window = PasswordManagerWindow(self.manager, self.file_path)
+        self.main_window.show()

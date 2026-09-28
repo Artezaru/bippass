@@ -38,7 +38,7 @@ def profile_path(username: str) -> Path:
     Returns
     -------
     Path
-        ``~/bippass/<username>.encrypted`` -- callers are responsible
+        ``~/.bippass/profiles/<username>.encrypted`` -- callers are responsible
         for creating :data:`PROFILES_DIR` if it doesn't exist yet
         (e.g. via ``profile_path(username).parent.mkdir(parents=True,
         exist_ok=True)``).
