@@ -31,32 +31,33 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # [preview]: pypdfium2, renders the PDF pages in the preview
-          # ("Show source"). tqdm ([progress]) is useless in the GUI.
-          pip install ".[preview]"
-          pip install pyinstaller
+          pip install .
+          # Pillow: lets PyInstaller convert app.png into the .ico Windows needs.
+          pip install pyinstaller pillow
+
+      # bippass/__main__.py starts the CLI, which shows nothing in a
+      # --windowed build: the executable is launched through a small
+      # script that calls the GUI entry point instead.
+      - name: Write GUI launcher
+        run: python -c "open('bippass_gui_launcher.py', 'w').write('from bippass.__main__ import __main_gui__\n__main_gui__()\n')"
 
       - name: Build executable (Linux)
         if: runner.os == 'Linux'
         run: |
           pyinstaller --name bippass --windowed --onefile \
             --add-data "bippass/resources:bippass/resources" \
-            --collect-submodules fontTools.ttLib.tables \
-            --collect-all pypdfium2 \
-            --collect-all pypdfium2_raw \
+            --collect-submodules bippass \
             --icon bippass/resources/app.png \
-            bippass/__main__.py
+            bippass_gui_launcher.py
 
       - name: Build executable (Windows)
         if: runner.os == 'Windows'
         run: |
           pyinstaller --name bippass --windowed --onefile `
             --add-data "bippass/resources;bippass/resources" `
-            --collect-submodules fontTools.ttLib.tables `
-            --collect-all pypdfium2 `
-            --collect-all pypdfium2_raw `
+            --collect-submodules bippass `
             --icon bippass/resources/app.png `
-            bippass/__main__.py
+            bippass_gui_launcher.py
 
       - name: Package artifact (Linux)
         if: runner.os == 'Linux'
@@ -76,7 +77,7 @@ jobs:
       - name: Build .deb package (Linux)
         if: runner.os == 'Linux'
         run: |
-          # "v1.0.0" -> "1.0.0"; "0.0.0" for a manual run (dpkg needs a version).
+          # "v3.0.0" -> "3.0.0"; "0.0.0" for a manual run (dpkg needs a version).
           VERSION="${GITHUB_REF_NAME#v}"
           if [ "${{ github.ref_type }}" != "tag" ]; then
             VERSION="0.0.0"
@@ -114,11 +115,10 @@ jobs:
           Type=Application
           Name=Bippass
           Comment=Manage passwords locally and offline
-          Exec=/usr/bin/bippass %F
+          Exec=/usr/bin/bippass
           $ICON_LINE
           Terminal=false
-          MimeType=application/pdf;
-          Categories=Office;Utility;
+          Categories=Utility;Security;
           EOF
 
           dpkg-deb --build --root-owner-group "$PKGROOT" "dist/bippass_${VERSION}_amd64.deb"
