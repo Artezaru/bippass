@@ -40,23 +40,23 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           pyinstaller --name bippass --windowed --onefile \
-            --add-data "watermark_pdf/resources:watermark_pdf/resources" \
+            --add-data "bippass/resources:bippass/resources" \
             --collect-submodules fontTools.ttLib.tables \
             --collect-all pypdfium2 \
             --collect-all pypdfium2_raw \
-            --icon watermark_pdf/resources/app.png \
-            watermark_pdf/__main__.py
+            --icon bippass/resources/app.png \
+            bippass/__main__.py
 
       - name: Build executable (Windows)
         if: runner.os == 'Windows'
         run: |
           pyinstaller --name bippass --windowed --onefile `
-            --add-data "watermark_pdf/resources;watermark_pdf/resources" `
+            --add-data "bippass/resources;bippass/resources" `
             --collect-submodules fontTools.ttLib.tables `
             --collect-all pypdfium2 `
             --collect-all pypdfium2_raw `
-            --icon watermark_pdf/resources/app.png `
-            watermark_pdf/__main__.py
+            --icon bippass/resources/app.png `
+            bippass/__main__.py
 
       - name: Package artifact (Linux)
         if: runner.os == 'Linux'
@@ -106,16 +106,14 @@ jobs:
           Architecture: amd64
           Depends: libgl1, libxkbcommon-x11-0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-randr0, libxcb-render-util0, libxcb-shape0, libxcb-xinerama0, libxcb-xkb1
           Maintainer: Artezaru <artezaru.github@proton.me>
-          Description: Add a repeated text watermark to PDF files.
-           Desktop application (PyQt5) to watermark PDF files or a whole
-           folder, with a live preview.
+          Description: Local, offline password manager with a Qt GUI and a command line, based on Artezaru/pyaescbc.
           EOF
 
-          cat > "$PKGROOT/usr/share/applications/watermark-pdf.desktop" <<EOF
+          cat > "$PKGROOT/usr/share/applications/bippass.desktop" <<EOF
           [Desktop Entry]
           Type=Application
           Name=Bippass
-          Comment=Add a text watermark to PDF files
+          Comment=Manage passwords locally and offline
           Exec=/usr/bin/bippass %F
           $ICON_LINE
           Terminal=false
