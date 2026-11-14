@@ -7,9 +7,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bippass"
-requires-python = ">= 3.10"
+requires-python = ">= 3.11"
 dynamic = ["version"]
-description = "Local python password manager with Qt-GUI based on Artezaru/pyaescbc."
+description = "Local, offline password manager with a Qt GUI and a command line, based on Artezaru/pyaescbc."
 license = {file = "LICENSE"}
 authors = [
     {name = "Artezaru", email = "artezaru.github@proton.me"},
@@ -18,11 +18,22 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Operating System :: OS Independent",
+    "Environment :: X11 Applications :: Qt",
+    "Environment :: Console",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Utilities",
 ]
 dependencies = [
     "pyqt5",
-    "pyaescbc>=2.1.0",
+    "pyaescbc>=3.0.0",
+    "rich",
 ]
+
+[project.scripts]
+bippass = "bippass.__main__:__main__"
+
+[project.gui-scripts]
+bippass-gui = "bippass.__main__:__main_gui__"
 
 [project.urls]
 Homepage = "https://github.com/Artezaru/bippass"

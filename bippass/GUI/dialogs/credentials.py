@@ -18,74 +18,88 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
-from PyQt5.QtWidgets import QComboBox, QDialog, QFormLayout, QMessageBox
+from PyQt5.QtWidgets import QComboBox, QDialog, QFormLayout, QLabel
 
 from ..translate import translator
-from ..widgets import PasswordField, ok_cancel_buttons
+from ..widgets import NewPasswordFields, PasswordField, ok_cancel_buttons, warn
 
 
-class ChangeCredentialsDialog(QDialog):
+class ChangePasswordDialog(QDialog):
     """
     Dialog to change either the primary or the secondary password.
+
+    Asks for the current password of the chosen side, and the new one
+    twice. Nothing is checked against the profile here: the caller
+    passes both to :meth:`PasswordManager.change_primary_password` or
+    :meth:`PasswordManager.change_secondary_password`, which check the
+    current one.
 
     Parameters
     ----------
     parent : QWidget, optional
         Parent widget.
-
-    Notes
-    -----
-    Only the side being changed is collected here: the caller
-    (`window.PasswordManagerWindow._open_change_credentials`) carries
-    the other side over unchanged from the manager's current
-    :class:`Credentials`.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(translator.translate("credentials.dialog_title"))
-
+        tr = translator.translate
+        self.setWindowTitle(tr("credentials.dialog_title"))
         layout = QFormLayout(self)
 
         self.target_combo = QComboBox()
-        self.target_combo.addItem(translator.translate("credentials.change_primary"), "primary")
-        self.target_combo.addItem(translator.translate("credentials.change_secondary"), "secondary")
+        self.target_combo.addItem(tr("credentials.change_primary"), "primary")
+        self.target_combo.addItem(tr("credentials.change_secondary"), "secondary")
         layout.addRow(self.target_combo)
 
-        self.password_field = PasswordField()
-        self.confirm_password_field = PasswordField()
-        layout.addRow(translator.translate("credentials.password_label"), self.password_field)
-        layout.addRow(
-            translator.translate("credentials.confirm_password_label"),
-            self.confirm_password_field,
-        )
+        hint = QLabel(tr("credentials.hint"))
+        hint.setObjectName("mutedLabel")
+        hint.setWordWrap(True)
+        layout.addRow(hint)
 
+        self.current_field = PasswordField()
+        layout.addRow(tr("credentials.current_password_label"), self.current_field)
+        self.new_fields = NewPasswordFields(
+            layout, tr("credentials.password_label"), tr("credentials.confirm_password_label")
+        )
         layout.addRow(ok_cancel_buttons(self, self._on_accept))
 
     def _on_accept(self) -> None:
-        """Accept the dialog if the password is set and confirmed, warn otherwise."""
-        password = self.password_field.text()
-        if not password:
-            message_key = "credentials.empty_password"
-        elif password != self.confirm_password_field.text():
-            message_key = "credentials.password_mismatch"
+        """Accept if every field is filled and the new password confirmed, warn otherwise."""
+        problem = "empty" if not self.current_field.text() else self.new_fields.problem()
+        if problem == "empty":
+            warn(self, "credentials.empty_password")
+        elif problem == "mismatch":
+            warn(self, "credentials.password_mismatch")
+        elif self.new_fields.text() == self.current_field.text():
+            warn(self, "credentials.same_password")
         else:
             self.accept()
-            return
-        QMessageBox.warning(
-            self, translator.translate("common.error_title"), translator.translate(message_key)
-        )
+
+    def _clear(self) -> None:
+        """Erase every typed password."""
+        self.current_field.clear()
+        self.new_fields.clear()
+
+    def reject(self) -> None:
+        """Erase the typed passwords, then close."""
+        self._clear()
+        super().reject()
 
     def get_data(self) -> dict:
         """
-        Return the side to change and its new password.
+        Return the side to change and both passwords, then erase the fields.
 
         Returns
         -------
         dict
-            ``{"target": "primary" or "secondary", "password": bytearray}``.
+            ``{"target": "primary" or "secondary", "current": bytearray,
+            "new": bytearray}``. The caller owns (and must erase) both
+            buffers; passing them to the manager does.
         """
-        return {
+        data = {
             "target": self.target_combo.currentData(),
-            "password": self.password_field.to_bytearray(),
+            "current": self.current_field.to_bytearray(),
+            "new": self.new_fields.to_bytearray(),
         }
+        self._clear()
+        return data

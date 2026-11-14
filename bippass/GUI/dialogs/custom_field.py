@@ -18,59 +18,61 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
-from PyQt5.QtWidgets import QComboBox, QDialog, QFormLayout, QLineEdit, QMessageBox
+from PyQt5.QtWidgets import QComboBox, QDialog, QFormLayout, QLabel, QLineEdit
 
+from ...core.item import FieldKind
 from ..translate import translator
-from ..widgets import ok_cancel_buttons
-
-# Custom field kinds offered: multi-value custom fields aren't supported.
-_CUSTOM_FIELD_KINDS = ("SCALAR", "ENCRYPTED")
+from ..widgets import ok_cancel_buttons, warn
 
 
 class CustomFieldDialog(QDialog):
     """
     Dialog to create a new custom field on an item.
 
+    Asks for a name and a kind: *clear* (stored like a login) or
+    *encrypted* (stored like a password, behind the secondary
+    password). Values are entered afterwards in the item viewer; a
+    custom field may hold several of them.
+
     Parameters
     ----------
-    existing_names : tuple of str, optional
-        Names of the item's current custom fields, refused as the new
-        field's name.
     parent : QWidget, optional
         Parent widget.
+
+    Notes
+    -----
+    Several custom fields may share a name: each has its own id. Only
+    a blank name is refused.
     """
 
-    def __init__(self, existing_names: tuple[str, ...] = (), parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(translator.translate("custom_field.dialog_title"))
+        tr = translator.translate
+        self.setWindowTitle(tr("custom_field.dialog_title"))
         self.setModal(True)
-        self._existing_names = existing_names
-
         layout = QFormLayout(self)
 
         self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText(
-            translator.translate("custom_field.field_name_placeholder")
-        )
-        layout.addRow(translator.translate("common.name_label"), self.name_edit)
+        self.name_edit.setPlaceholderText(tr("custom_field.field_name_placeholder"))
+        layout.addRow(tr("common.name_label"), self.name_edit)
 
         self.kind_combo = QComboBox()
-        self.kind_combo.addItems(_CUSTOM_FIELD_KINDS)
-        layout.addRow(translator.translate("common.type_label"), self.kind_combo)
+        self.kind_combo.addItem(tr("custom_field.kind_clear"), FieldKind.CLEAR)
+        self.kind_combo.addItem(tr("custom_field.kind_encrypted"), FieldKind.ENCRYPTED)
+        layout.addRow(tr("common.type_label"), self.kind_combo)
 
+        hint = QLabel(tr("custom_field.kind_hint"))
+        hint.setObjectName("mutedLabel")
+        hint.setWordWrap(True)
+        layout.addRow(hint)
         layout.addRow(ok_cancel_buttons(self, self._on_accept))
 
     def _on_accept(self) -> None:
-        """Accept the dialog if the name is set and not taken, warn otherwise."""
-        name = self.name_edit.text().strip()
-        if not name:
-            message = translator.translate("custom_field.field_name_required")
-        elif name in self._existing_names:
-            message = translator.translate("custom_field.field_already_exists", name=name)
-        else:
+        """Accept the dialog if the name is set, warn otherwise."""
+        if self.name_edit.text().strip():
             self.accept()
             return
-        QMessageBox.warning(self, translator.translate("common.error_title"), message)
+        warn(self, "custom_field.field_name_required")
 
     def get_data(self) -> dict:
         """
@@ -79,9 +81,6 @@ class CustomFieldDialog(QDialog):
         Returns
         -------
         dict
-            ``{"name": str, "kind": "SCALAR" or "ENCRYPTED"}``.
+            ``{"name": str, "kind": FieldKind}``, the name stripped.
         """
-        return {
-            "name": self.name_edit.text().strip(),
-            "kind": self.kind_combo.currentText(),
-        }
+        return {"name": self.name_edit.text().strip(), "kind": self.kind_combo.currentData()}

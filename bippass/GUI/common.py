@@ -18,37 +18,23 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import functools
-import os
 from importlib import resources
 
-from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt
+from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
+
+from .translate import translator
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-# Zoom step and bounds, as a delta (pt) on the application's base font size.
-_ZOOM_STEP_PT = 1
-_ZOOM_MIN_DELTA_PT = -4
-_ZOOM_MAX_DELTA_PT = 16
-
-# Spacer width (px) before the theme toggle button, at the toolbar's left edge.
-TOOLBAR_LEFT_SPACING_PX = 16
-
-# Padding (px) subtracted from `save_btn`'s height to size the theme icon.
-_THEME_BTN_ICON_PADDING_PX = 10
-
-# Minimum icon size (px) in `item_list` and `vault_list`.
-_ITEM_ICON_MIN_SIZE_PX = 20
-_VAULT_ICON_MIN_SIZE_PX = 20
-
-# Extra size (pt) of vault names in `vault_list`, relative to the base font.
-_VAULT_NAME_FONT_DELTA_PT = 2
-
-# Inactivity delay (s) used if the manager's metadata carries none.
-_DEFAULT_CLOSE_TIMER_S = 300
+# Side (px) of the square images stored as item and vault icons.
+_STORED_ICON_SIZE_PX = 64
 
 
 # ---------------------------------------------------------------------------
@@ -252,23 +238,6 @@ def _vault_icon_path(filename: str) -> str | None:
     return _resource_path(_VAULT_ICONS_DIR, filename)
 
 
-def _vault_icon(filename: str) -> QIcon | None:
-    """
-    Load a bundled vault icon.
-
-    Parameters
-    ----------
-    filename : str
-        File name in ``resources/vault_icons``.
-
-    Returns
-    -------
-    QIcon or None
-        The loaded icon, or ``None`` if it is missing or unreadable.
-    """
-    return _resource_icon(_VAULT_ICONS_DIR, filename)
-
-
 def _item_icon_path(filename: str) -> str | None:
     """
     Return the absolute path of a bundled item icon.
@@ -303,57 +272,333 @@ def _item_icon(filename: str) -> QIcon | None:
     return _resource_icon(_ITEM_ICONS_DIR, filename)
 
 
-def _load_item_icon(value: str | None) -> QIcon | None:
+# ---------------------------------------------------------------------------
+# Stored icons (Base64)
+# ---------------------------------------------------------------------------
+#
+# Item and vault icons are stored in the profile itself, as a Base64
+# PNG image (see `Item.set_icon` and `Vault.set_icon`): a profile stays
+# complete when moved to another computer, and no path on disk is ever
+# stored. Bundled icons and image files are converted when picked.
+
+
+def _image_to_base64(image: QImage, size: int = _STORED_ICON_SIZE_PX) -> str | None:
     """
-    Load an item's icon from its stored value.
+    Encode an image as a stored icon.
+
+    Parameters
+    ----------
+    image : QImage
+        Image to encode.
+    size : int, optional
+        Side (px) of the square the image is scaled into, keeping its
+        aspect ratio. Default is :data:`_STORED_ICON_SIZE_PX`.
+
+    Returns
+    -------
+    str or None
+        The scaled image as a Base64 PNG, or ``None`` if ``image`` is
+        null or cannot be encoded.
+
+    Notes
+    -----
+    Scaling keeps the profile small: a 64 px PNG weighs a few KB,
+    whatever the size of the picked file.
+    """
+    if image.isNull():
+        return None
+    scaled = image.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QIODevice.WriteOnly)
+    ok = scaled.save(buffer, "PNG")
+    buffer.close()
+    if not ok:
+        return None
+    return base64.b64encode(bytes(data)).decode("ascii")
+
+
+def _file_to_base64(path: str, size: int = _STORED_ICON_SIZE_PX) -> str | None:
+    """
+    Encode an image file as a stored icon.
+
+    Parameters
+    ----------
+    path : str
+        Path of an image file in any format Qt can read.
+    size : int, optional
+        See :func:`_image_to_base64`.
+
+    Returns
+    -------
+    str or None
+        The Base64 PNG, or ``None`` if the file is missing or isn't a
+        readable image.
+    """
+    return _image_to_base64(QImage(path), size)
+
+
+def _bundled_icon_name(subdir: str, icon: str | None) -> str | None:
+    """
+    Find the bundled icon a stored icon was made from.
+
+    Parameters
+    ----------
+    subdir : str
+        Folder of the bundled icons, :data:`_ITEM_ICONS_DIR` or
+        :data:`_VAULT_ICONS_DIR`.
+
+    icon : str or None
+        Stored Base64 icon.
+
+    Returns
+    -------
+    str or None
+        The bundled filename, or ``None`` if none matches.
+
+    Notes
+    -----
+    A bundled icon is encoded the same way every time it is picked
+    (see :func:`_file_to_base64`), so comparing encodings finds it.
+    The encodings of a folder are computed once per run.
+    """
+    if not icon:
+        return None
+    return _bundled_encodings(subdir).get(icon)
+
+
+@functools.lru_cache(maxsize=None)
+def _bundled_encodings(subdir: str) -> dict[str, str]:
+    """
+    Encode every bundled icon of a folder as a stored icon.
+
+    Returns
+    -------
+    dict of str to str
+        Base64 encoding -> bundled filename.
+    """
+    encodings: dict[str, str] = {}
+    for name in _list_resource_names(subdir):
+        path = _resource_path(subdir, name)
+        encoded = _file_to_base64(path) if path is not None else None
+        if encoded is not None:
+            encodings.setdefault(encoded, name)
+    return encodings
+
+
+@functools.lru_cache(maxsize=512)
+def _pixmap_from_base64(value: str) -> QPixmap | None:
+    """
+    Decode a stored icon.
+
+    Parameters
+    ----------
+    value : str
+        Base64-encoded image.
+
+    Returns
+    -------
+    QPixmap or None
+        The image, or ``None`` if ``value`` isn't valid Base64 or
+        doesn't hold a readable image.
+
+    Notes
+    -----
+    Cached by value: lists are rebuilt often (search, zoom...), and
+    decoding every icon each time would be wasteful. Sharing a
+    :class:`QPixmap` is safe since Qt pixmaps are implicitly shared.
+    """
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    pixmap = QPixmap()
+    if not pixmap.loadFromData(raw):
+        return None
+    return pixmap
+
+
+def _icon_from_base64(value: str | None) -> QIcon | None:
+    """
+    Load a stored icon as a :class:`QIcon`.
 
     Parameters
     ----------
     value : str or None
-        A bare filename referring to a bundled item icon
-        (``"github.png"``), or a path to an image file on disk.
+        Base64-encoded image, as returned by ``get_icon()``.
 
     Returns
     -------
     QIcon or None
-        The icon, or ``None`` if ``value`` is empty or doesn't resolve
-        to a readable image. There is no fallback here, see
-        :func:`_item_icon_or_default`.
-
-    Notes
-    -----
-    Bundled icons are cached (see :func:`_resource_icon`); files on
-    disk are re-read on every call, since the user may replace them.
+        The icon, or ``None`` if ``value`` is empty or unreadable.
     """
     if not value:
         return None
-    if not os.path.dirname(value):
-        return _item_icon(value)
-    try:
-        if not os.path.isfile(value):
-            return None
-    except OSError:
-        # e.g. a network share failing mid-lookup: treated as unreadable.
-        return None
-    icon = QIcon(value)
-    return None if icon.isNull() else icon
+    pixmap = _pixmap_from_base64(value)
+    return None if pixmap is None else QIcon(pixmap)
 
 
-def _item_icon_or_default(value: str | None) -> QIcon | None:
+def _with_background(icon: QIcon, color: str | None) -> QIcon:
+    """
+    Paint an icon over a plain background color.
+
+    Parameters
+    ----------
+    icon : QIcon
+        The icon, possibly with transparent pixels.
+    color : str or None
+        Background color, e.g. ``"#ffffff"`` (``Item.get_color()``).
+        ``None``, an empty string or a color Qt can't parse leaves the
+        icon unchanged: its transparent pixels stay transparent.
+
+    Returns
+    -------
+    QIcon
+        A square icon of :data:`_STORED_ICON_SIZE_PX`, filled with
+        ``color``, with ``icon`` centered on top: its transparent
+        pixels now show the color, which improves the contrast of a
+        dark logo on a dark theme (or the reverse).
+    """
+    qcolor = QColor(color) if color else QColor()
+    if not qcolor.isValid():
+        return icon
+    size = _STORED_ICON_SIZE_PX
+    source = icon.pixmap(QSize(size, size))
+    canvas = QPixmap(size, size)
+    canvas.fill(qcolor)
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform)
+    painter.drawPixmap((size - source.width()) // 2, (size - source.height()) // 2, source)
+    painter.end()
+    return QIcon(canvas)
+
+
+@functools.lru_cache(maxsize=512)
+def _item_icon_or_default(value: str | None, background: str | None = None) -> QIcon | None:
     """
     Load an item's icon, falling back to the bundled default icon.
 
     Parameters
     ----------
     value : str or None
-        Stored icon value, see :func:`_load_item_icon`.
+        Stored icon (Base64), as returned by :meth:`Item.get_icon`.
+    background : str or None, optional
+        Background color of the icon, as returned by
+        :meth:`Item.get_color`. ``None`` (the default) keeps the
+        transparent pixels transparent; see :func:`_with_background`.
 
     Returns
     -------
     QIcon or None
         The item's icon, the bundled ``_default.png`` if the value is
         empty or unreadable, or ``None`` if even the default is
-        missing.
+        missing; painted over ``background`` if one is given.
+
+    Notes
+    -----
+    Cached by ``(value, background)``: item lists are rebuilt often
+    (search, zoom...). Sharing a :class:`QIcon` is safe since Qt icons
+    are implicitly shared.
     """
-    icon = _load_item_icon(value)
-    return icon if icon is not None else _item_icon(_DEFAULT_ITEM_ICON)
+    icon = _icon_from_base64(value)
+    if icon is None:
+        icon = _item_icon(_DEFAULT_ITEM_ICON)
+    if icon is None:
+        return None
+    return _with_background(icon, background)
+
+
+def tint_pixmap(pixmap: QPixmap, color: QColor) -> QPixmap:
+    """
+    Recolor every non-transparent pixel of a pixmap.
+
+    Parameters
+    ----------
+    pixmap : QPixmap
+        Source icon, whatever its original color(s).
+
+    color : QColor
+        Color to paint the icon's shape with.
+
+    Returns
+    -------
+    QPixmap
+        A new pixmap the same size as ``pixmap``, with the same alpha
+        shape, filled with ``color``.
+    """
+    tinted = QPixmap(pixmap.size())
+    tinted.fill(Qt.transparent)
+    painter = QPainter(tinted)
+    painter.drawPixmap(0, 0, pixmap)
+    # SourceIn keeps the destination's alpha and replaces its color,
+    # so the transparent background stays transparent.
+    painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    painter.fillRect(tinted.rect(), QColor(color))
+    painter.end()
+    return tinted
+
+
+def vault_icon_pixmap(icon: str | None, color: str | None = None) -> QPixmap | None:
+    """
+    Decode, and optionally tint, the pixmap of a vault's icon.
+
+    Parameters
+    ----------
+    icon : str or None
+        Stored vault icon, a Base64 image (``Vault.get_icon()``).
+
+    color : str or None, optional
+        Vault color (``Vault.get_color()``, e.g. ``"#3478f6"``). The
+        icon is left untinted if empty or not a color Qt can parse.
+
+    Returns
+    -------
+    QPixmap or None
+        ``None`` if ``icon`` is empty or unreadable; callers should
+        then show no icon at all, never a placeholder.
+    """
+    pixmap = _pixmap_from_base64(icon) if icon else None
+    if pixmap is None or not color:
+        return pixmap
+    qcolor = QColor(color)
+    if not qcolor.isValid():
+        return pixmap
+    return tint_pixmap(pixmap, qcolor)
+
+
+# ---------------------------------------------------------------------------
+# Names
+# ---------------------------------------------------------------------------
+
+def vault_display_name(vault) -> str:
+    """
+    Return the name shown for a vault.
+
+    Parameters
+    ----------
+    vault : Vault
+        The vault.
+
+    Returns
+    -------
+    str
+        Its name, or a translated placeholder if it has none.
+    """
+    return vault.get_name() or translator.translate("common.unnamed_vault")
+
+
+def item_display_name(item) -> str:
+    """
+    Return the name shown for an item.
+
+    Parameters
+    ----------
+    item : Item
+        The item.
+
+    Returns
+    -------
+    str
+        Its name, or a translated placeholder if it has none.
+    """
+    return item.get_name() or translator.translate("common.unnamed_item")

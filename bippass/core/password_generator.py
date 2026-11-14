@@ -18,10 +18,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
+import functools
+import math
+import re
 import secrets
 import string
+from dataclasses import dataclass
 from enum import Enum, auto
 from importlib import resources
+from types import MappingProxyType
+from typing import Mapping
 
 
 class GeneratorType(Enum):
@@ -79,9 +85,189 @@ def _wordlist_path(language: str) -> str:
         return str(path)
 
 
+#: A dice-indexed line: a run of dice faces (1-6), whitespace, a word.
+_DICE_LINE = re.compile(r"^([1-6]+)\s+(\S+)$")
+
+
+@dataclass(frozen=True)
+class Wordlist:
+    """
+    A parsed word list.
+
+    Two file formats are supported (see :func:`parse_wordlist`):
+
+    - **dice-indexed** (EFF / diceware format): every line is
+      ``<dice faces><whitespace><word>``, e.g. ``11111\tabacus`` or
+      ``11111 abaisse``. Words are then drawn by rolling
+      :attr:`dice_count` virtual six-sided dice and looking the result
+      up, exactly as the diceware method does with real dice;
+    - **plain**: one word per line, drawn uniformly with
+      :func:`secrets.choice`.
+
+    Attributes
+    ----------
+    words : tuple of str
+        Every word, in file order.
+
+    dice_count : int or None
+        Number of dice per word for a dice-indexed list (5 for the
+        EFF large list), ``None`` for a plain list.
+
+    by_dice : Mapping of str to str or None
+        Dice faces (e.g. ``"43463"``) to word, for a dice-indexed
+        list; ``None`` for a plain list.
+    """
+
+    words: tuple[str, ...]
+    dice_count: int | None = None
+    by_dice: Mapping[str, str] | None = None
+
+    @property
+    def size(self) -> int:
+        """Number of distinct words that can be drawn."""
+        return len(self.words)
+
+    @property
+    def bits_per_word(self) -> float:
+        """Entropy contributed by one uniformly drawn word, in bits."""
+        return math.log2(self.size)
+
+    def draw(self) -> str:
+        """
+        Draw one word uniformly at random.
+
+        Returns
+        -------
+        str
+            For a dice-indexed list, the word matching
+            :attr:`dice_count` rolls of :func:`roll_dice`; for a plain
+            list, :func:`secrets.choice` over :attr:`words`.
+        """
+        if self.by_dice is not None:
+            assert self.dice_count is not None  # set together with by_dice
+            return self.by_dice[roll_dice(self.dice_count)]
+        return secrets.choice(self.words)
+
+
+def roll_dice(count: int) -> str:
+    """
+    Roll ``count`` virtual six-sided dice.
+
+    Parameters
+    ----------
+    count : int
+        Number of dice. Must be strictly positive.
+
+    Returns
+    -------
+    str
+        The faces, e.g. ``"43463"`` for ``count=5``.
+
+    Notes
+    -----
+    Uses :func:`secrets.randbelow`, a cryptographically secure source
+    of randomness, so every face (and therefore every word of a
+    dice-indexed list) is exactly equally likely.
+    """
+    if count <= 0:
+        raise ValueError("count must be strictly positive.")
+    return "".join(str(secrets.randbelow(6) + 1) for _ in range(count))
+
+
+def parse_wordlist(text: str, name: str = "word list") -> Wordlist:
+    """
+    Parse the content of a word list file.
+
+    Parameters
+    ----------
+    text : str
+        File content. Empty lines and surrounding whitespace are ignored.
+
+    name : str, optional
+        Name used in error messages.
+
+    Returns
+    -------
+    Wordlist
+        Dice-indexed if *every* line starts with dice faces, plain if
+        *none* does.
+
+    Raises
+    ------
+    ValueError
+        If the list is empty, mixes both formats, a plain line holds
+        more than one word, a word appears twice, or (dice-indexed)
+        the dice runs don't all have the same length or don't cover
+        every one of the ``6 ** dice_count`` combinations exactly once
+        -- any of which would make some words likelier than others.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(f"The {name} is empty.")
+
+    matches = [m for m in (_DICE_LINE.match(line) for line in lines) if m is not None]
+
+    if len(matches) == len(lines):
+        keys = [m.group(1) for m in matches]
+        words = tuple(m.group(2) for m in matches)
+        dice_count = len(keys[0])
+        if any(len(key) != dice_count for key in keys):
+            raise ValueError(f"The {name} mixes dice runs of different lengths.")
+        if len(set(keys)) != len(keys) or len(keys) != 6 ** dice_count:
+            raise ValueError(
+                f"The {name} must list each of the {6 ** dice_count} "
+                f"combinations of {dice_count} dice exactly once "
+                f"({len(set(keys))} distinct found)."
+            )
+        by_dice = MappingProxyType(dict(zip(keys, words)))
+    elif not any(matches):
+        if any(len(line.split()) != 1 for line in lines):
+            raise ValueError(f"The {name} must hold one word per line.")
+        words = tuple(lines)
+        dice_count, by_dice = None, None
+    else:
+        raise ValueError(
+            f"The {name} mixes dice-indexed lines and plain lines."
+        )
+
+    if len(set(words)) != len(words):
+        raise ValueError(f"The {name} contains duplicate words.")
+
+    return Wordlist(words=words, dice_count=dice_count, by_dice=by_dice)
+
+
+@functools.lru_cache(maxsize=None)
+def get_wordlist(language: str) -> Wordlist:
+    """
+    Load and parse the bundled word list for ``language`` (cached).
+
+    Parameters
+    ----------
+    language : str
+        One of :data:`WORDLIST_LANGUAGES`.
+
+    Returns
+    -------
+    Wordlist
+        The parsed list, read from disk only on the first call.
+
+    Raises
+    ------
+    ValueError
+        If ``language`` is not one of :data:`WORDLIST_LANGUAGES`, or
+        the file is invalid (see :func:`parse_wordlist`).
+
+    OSError
+        If the word list file cannot be found or read.
+    """
+    path = _wordlist_path(language)
+    with open(path, "r", encoding="utf-8") as f:
+        return parse_wordlist(f.read(), name=f"{language!r} word list")
+
+
 def load_wordlist(language: str) -> tuple[str, ...]:
     """
-    Load the bundled word list for ``language``.
+    Return every word of the bundled word list for ``language``.
 
     Parameters
     ----------
@@ -91,27 +277,14 @@ def load_wordlist(language: str) -> tuple[str, ...]:
     Returns
     -------
     tuple of str
-        Every non-empty, stripped line of the word list file, in
-        file order (duplicates, if any, are not removed here -- the
-        bundled files are expected to already be deduplicated).
+        The words in file order, without their dice numbers.
 
     Raises
     ------
-    ValueError
-        If ``language`` is not one of :data:`WORDLIST_LANGUAGES`, or
-        the file is empty.
-
-    OSError
-        If the word list file cannot be found or read.
+    ValueError, OSError
+        See :func:`get_wordlist`.
     """
-    path = _wordlist_path(language)
-    with open(path, "r", encoding="utf-8") as f:
-        words = tuple(line.strip() for line in f if line.strip())
-
-    if not words:
-        raise ValueError(f"The {language!r} word list is empty.")
-
-    return words
+    return get_wordlist(language).words
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +394,9 @@ def generate_memorable_password(
 ) -> str:
     """
     Generate a passphrase from ``word_count`` random words drawn (with
-    replacement) from the bundled word list for ``language``, each
+    replacement) from the bundled word list for ``language`` (by rolling
+    virtual dice for a dice-indexed EFF-style list, see
+    :class:`Wordlist`), each
     immediately followed by its own run of ``digit_count`` random
     digits (not one single trailing digit group).
 
@@ -276,9 +451,9 @@ def generate_memorable_password(
     if digit_count < 0:
         raise ValueError("digit_count must not be negative.")
 
-    words = load_wordlist(language)
+    wordlist = get_wordlist(language)
 
-    chosen = [secrets.choice(words) for _ in range(word_count)]
+    chosen = [wordlist.draw() for _ in range(word_count)]
     if capitalize:
         chosen = [word.capitalize() for word in chosen]
 
@@ -288,6 +463,40 @@ def generate_memorable_password(
     ]
 
     return separator.join(segments)
+
+
+def memorable_password_entropy(
+    word_count: int,
+    *,
+    language: str = "en",
+    digit_count: int = 0,
+) -> float:
+    """
+    Entropy, in bits, of a passphrase from :func:`generate_memorable_password`.
+
+    Parameters
+    ----------
+    word_count, language, digit_count
+        Same meaning as in :func:`generate_memorable_password`.
+
+    Returns
+    -------
+    float
+        ``word_count * (log2(word list size) + digit_count * log2(10))``.
+        Capitalization and the separator are fixed, so they add nothing.
+        The attacker is assumed to know the word list and the settings.
+
+    Raises
+    ------
+    ValueError
+        Same conditions as :func:`generate_memorable_password`.
+    """
+    if word_count <= 0:
+        raise ValueError("word_count must be strictly positive.")
+    if digit_count < 0:
+        raise ValueError("digit_count must not be negative.")
+    bits_per_word = get_wordlist(language).bits_per_word
+    return word_count * (bits_per_word + digit_count * math.log2(10))
 
 
 # ---------------------------------------------------------------------------

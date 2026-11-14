@@ -23,7 +23,7 @@ class VaultNotFoundError(PasswordManagerError):
     """Raised when a requested vault does not exist."""
 
 class VaultAlreadyExistsError(PasswordManagerError):
-    """Raised when attempting to add a vault with a name that already exists."""
+    """Raised when attempting to add a vault with a UUID that already exists."""
 
 class ItemNotFoundError(PasswordManagerError):
     """Raised when a requested item does not exist."""
@@ -31,14 +31,23 @@ class ItemNotFoundError(PasswordManagerError):
 class ItemAlreadyExistsError(PasswordManagerError):
     """Raised when attempting to add an item with a UUID that already exists."""
 
-class PrimaryPasswordError(PasswordManagerError):
-    """Raised when the primary credentials are invalid."""
+class WrongPasswordError(PasswordManagerError):
+    """Raised when a password fails to unwrap a key (see :meth:`DataKey.unwrap`)."""
 
-class SecondaryPasswordError(PasswordManagerError):
-    """Raised when the secondary credentials are invalid."""
+class PrimaryPasswordError(WrongPasswordError):
+    """Raised when the primary password is wrong."""
+
+class SecondaryPasswordError(WrongPasswordError):
+    """Raised when the secondary password is wrong."""
 
 class CorruptedBase64Error(PasswordManagerError):
     """Raised when Base64 data is malformed or cannot be decoded."""
 
-class CorruptedUtf8Error(PasswordManagerError):
-    """Raised when data cannot be encoded to or decoded from UTF-8."""
+class TamperedDataError(PasswordManagerError):
+    """Raised when encrypted data fails authentication (wrong key or context, or tampering)."""
+
+class UnsupportedVersionError(PasswordManagerError):
+    """Raised when a file uses a format version this software cannot read (yet)."""
+
+class CorruptedFileError(PasswordManagerError):
+    """Raised when a file is not a valid bippass file."""

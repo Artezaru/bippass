@@ -14,73 +14,28 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-Dialogs of the bippass GUI
-==========================
-
-Every dialog is a :class:`QDialog` opened with ``exec_()``. When it
-returns ``QDialog.Accepted``, the caller reads the result through the
-dialog's ``get_data``, ``get_path``, ``get_password`` or ``apply_to``
-method.
-
-Account
--------
-- :class:`AccountSettingsDialog` -- theme, language and inactivity
-  auto-close delay.
-- :class:`MetadataDialog` -- account metadata (username).
-- :class:`ChangeCredentialsDialog` -- primary or secondary password.
-
-Items and vaults
-----------------
-- :class:`ItemIconDialog` -- item icon, bundled logo or image file.
-- :class:`CustomFieldDialog` -- new custom field on an item.
-- :class:`VaultIconDialog` -- vault icon and its color.
-- :class:`ExportItemsDialog` -- export items to a standalone vault file.
-- :class:`ImportItemsDialog` -- import items from a standalone vault file.
-
-Tools
------
-- :class:`GeneratorDialog` -- random or memorable password generator.
-- :class:`HelpDialog` -- usage and keyboard shortcuts.
-
-Vault icon helpers
-------------------
-- :func:`load_vault_icon_pixmap` -- raw pixmap of a bundled vault icon.
-- :func:`tint_pixmap` -- recolor a pixmap, keeping its alpha shape.
-- :func:`vault_icon_pixmap` -- vault icon pixmap, tinted with its color.
 """
 
-from .credentials import ChangeCredentialsDialog
+from .credentials import ChangePasswordDialog
 from .custom_field import CustomFieldDialog
 from .generator import GeneratorDialog
 from .help import HelpDialog
-from .item_icon import ItemIconDialog
+from .item_icon import ItemIconDialog, ask_item_icon
 from .metadata import MetadataDialog
 from .settings import AccountSettingsDialog
 from .transfer import ExportItemsDialog, ImportItemsDialog
-from .vault_icon import (
-    VaultIconDialog,
-    load_vault_icon_pixmap,
-    tint_pixmap,
-    vault_icon_pixmap,
-)
+from .vault_icon import VaultIconDialog
 
 __all__ = [
-    # Account
     "AccountSettingsDialog",
-    "MetadataDialog",
-    "ChangeCredentialsDialog",
-    # Items and vaults
-    "ItemIconDialog",
+    "ChangePasswordDialog",
     "CustomFieldDialog",
-    "VaultIconDialog",
     "ExportItemsDialog",
-    "ImportItemsDialog",
-    # Tools
     "GeneratorDialog",
     "HelpDialog",
-    # Vault icon helpers
-    "load_vault_icon_pixmap",
-    "tint_pixmap",
-    "vault_icon_pixmap",
+    "ImportItemsDialog",
+    "ItemIconDialog",
+    "MetadataDialog",
+    "VaultIconDialog",
+    "ask_item_icon",
 ]

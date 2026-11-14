@@ -18,12 +18,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
+from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtWidgets import QApplication
 
 from .common import _gui_icon_path
+from .local_settings import read_setting, write_setting
 
 
 LIGHT = "light"
@@ -31,9 +32,16 @@ DARK = "dark"
 THEMES = (LIGHT, DARK)
 DEFAULT_THEME = DARK
 
-# Remembers the theme between runs, for the unlock wizard shown before
-# any manager (and its own theme setting) is decrypted.
-_SETTINGS_FILE_PATH = Path.home() / ".bippass" / "settings.json"
+# The theme is also remembered on this computer (see `local_settings`),
+# for the start page, shown before any profile (and its own theme
+# preference) is unlocked.
+
+# Height (px, at zoom 1) of the content of every one-line control:
+# inputs, combo boxes and buttons, so that they all line up.
+_CONTROL_CONTENT_HEIGHT_PX = 20
+
+# Side (px) of the content of the icon buttons of the vault icon dialog.
+_ICON_CHOICE_SIZE_PX = 56
 
 _PALETTES: dict[str, dict[str, str]] = {
     LIGHT: {
@@ -56,8 +64,6 @@ _PALETTES: dict[str, dict[str, str]] = {
         "input_bg": "#FFFFFF",
         "field_bg": "#FFFFFF",
         "value_bg": "#F9FAFB",
-        "error_bg": "#FEF2F2",
-        "error_text": "#DC2626",
         "warning_bg": "#FFFBEB",
         "warning_border": "#F59E0B",
         "success_bg": "#DCFCE7",
@@ -67,6 +73,11 @@ _PALETTES: dict[str, dict[str, str]] = {
         "unsaved": "#F59E0B",
         "unsaved_hover": "#D97706",
         "unsaved_text": "#1F2937",
+        "decrypted": "#16A34A",
+        "decrypted_hover": "#15803D",
+        "encrypted": "#CA8A04",
+        "encrypted_hover": "#A16207",
+        "state_text": "#FFFFFF",
         "scroll": "#CDD2DA",
     },
     DARK: {
@@ -89,8 +100,6 @@ _PALETTES: dict[str, dict[str, str]] = {
         "input_bg": "#12151A",
         "field_bg": "#181B21",
         "value_bg": "#1D2128",
-        "error_bg": "#2A1618",
-        "error_text": "#F87171",
         "warning_bg": "#2E2715",
         "warning_border": "#F59E0B",
         "success_bg": "#14301F",
@@ -100,19 +109,24 @@ _PALETTES: dict[str, dict[str, str]] = {
         "unsaved": "#F59E0B",
         "unsaved_hover": "#D97706",
         "unsaved_text": "#111827",
+        "decrypted": "#22C55E",
+        "decrypted_hover": "#16A34A",
+        "encrypted": "#EAB308",
+        "encrypted_hover": "#CA8A04",
+        "state_text": "#111827",
         "scroll": "#3A404B",
     },
 }
 
 
-def _valid_theme(theme: str | None) -> str:
+def _valid_theme(theme: object) -> str:
     """
     Return a theme name, falling back to the default for unknown ones.
 
     Parameters
     ----------
-    theme : str or None
-        Theme name to check.
+    theme : object
+        Theme name to check (any stored value).
 
     Returns
     -------
@@ -188,8 +202,12 @@ def stylesheet(theme: str, text_scale: float = 1.0) -> str:
     def px(base: float) -> int:
         return max(1, round(base * text_scale))
 
+    # Every one-line control gets the same content height and vertical
+    # padding (6px), hence the same total height.
+    control = px(_CONTROL_CONTENT_HEIGHT_PX)
+
     return f"""
-        QMainWindow, QWidget, QDialog, QWizard {{
+        QMainWindow, QWidget, QDialog {{
             background-color: {c['bg']};
             color: {c['text']};
         }}
@@ -227,6 +245,9 @@ def stylesheet(theme: str, text_scale: float = 1.0) -> str:
         QComboBox:focus, QSpinBox:focus {{
             border-color: {c['accent']};
         }}
+        QLineEdit, QComboBox, QSpinBox {{
+            min-height: {control}px;
+        }}
         QLineEdit:disabled, QComboBox:disabled {{
             color: {c['disabled']};
         }}
@@ -234,7 +255,6 @@ def stylesheet(theme: str, text_scale: float = 1.0) -> str:
         /* --- Combo boxes ---------------------------------------------- */
         QComboBox {{
             padding-right: 28px;
-            min-height: 20px;
         }}
         QComboBox:on {{
             border-color: {c['accent']};
@@ -275,7 +295,8 @@ def stylesheet(theme: str, text_scale: float = 1.0) -> str:
             color: {c['accent_text']};
             border: 1px solid {c['accent']};
             border-radius: 8px;
-            padding: 7px 14px;
+            padding: 6px 14px;
+            min-height: {control}px;
             font-weight: 600;
         }}
         QPushButton:hover {{
@@ -292,14 +313,66 @@ def stylesheet(theme: str, text_scale: float = 1.0) -> str:
             color: {c['text_muted']};
         }}
         QPushButton#smallButton {{
-            padding: 2px;
+            padding: 6px 10px;
         }}
-        QPushButton#dangerButton {{
+        QPushButton#squareButton {{
+            padding: 6px;
+            min-width: {control}px;
+            max-width: {control}px;
+        }}
+        /* Square: the same min and max, on both sides (QSS sizes
+           override `setFixedSize`). The border keeps its width when
+           checked, so the buttons never move. */
+        QPushButton#iconChoiceButton {{
+            background-color: transparent;
+            border: 2px solid {c['border']};
+            border-radius: 8px;
+            padding: 0;
+            min-width: {_ICON_CHOICE_SIZE_PX}px;
+            max-width: {_ICON_CHOICE_SIZE_PX}px;
+            min-height: {_ICON_CHOICE_SIZE_PX}px;
+            max-height: {_ICON_CHOICE_SIZE_PX}px;
+            color: {c['text']};
+            font-size: {px(18)}px;
+        }}
+        QPushButton#iconChoiceButton:hover {{
+            background-color: {c['hover']};
+            border-color: {c['text_muted']};
+        }}
+        QPushButton#iconChoiceButton:checked {{
+            background-color: {c['accent_soft']};
+            border-color: {c['accent']};
+        }}
+        QLabel#iconPreview {{
+            background-color: {c['bg_alt']};
+            border: 1px solid {c['border']};
+            border-radius: 10px;
+            color: {c['text_muted']};
+        }}
+        QPushButton#cryptButton[state="decrypted"] {{
+            background-color: {c['decrypted']};
+            border-color: {c['decrypted']};
+            color: {c['state_text']};
+        }}
+        QPushButton#cryptButton[state="decrypted"]:hover {{
+            background-color: {c['decrypted_hover']};
+            border-color: {c['decrypted_hover']};
+        }}
+        QPushButton#cryptButton[state="encrypted"] {{
+            background-color: {c['encrypted']};
+            border-color: {c['encrypted']};
+            color: {c['state_text']};
+        }}
+        QPushButton#cryptButton[state="encrypted"]:hover {{
+            background-color: {c['encrypted_hover']};
+            border-color: {c['encrypted_hover']};
+        }}
+        QPushButton[danger="true"] {{
             background-color: {c['danger']};
             border-color: {c['danger']};
             color: {c['danger_text']};
         }}
-        QPushButton#dangerButton:hover {{
+        QPushButton[danger="true"]:hover {{
             background-color: {c['danger_hover']};
             border-color: {c['danger_hover']};
         }}
@@ -440,12 +513,6 @@ def stylesheet(theme: str, text_scale: float = 1.0) -> str:
             color: {c['text_muted']};
             font-size: {px(11)}px;
         }}
-        QLabel#errorLabel {{
-            color: {c['error_text']};
-            background-color: {c['error_bg']};
-            padding: 8px 10px;
-            border-radius: 8px;
-        }}
         QLineEdit#itemTitleEdit {{
             background: transparent;
             border: none;
@@ -454,6 +521,7 @@ def stylesheet(theme: str, text_scale: float = 1.0) -> str:
             font-size: {px(18)}px;
             font-weight: 600;
             padding: 4px 2px;
+            min-height: 0;
         }}
         QLineEdit#itemTitleEdit:focus {{
             border-bottom: 1px solid {c['accent']};
@@ -465,6 +533,31 @@ def stylesheet(theme: str, text_scale: float = 1.0) -> str:
             border: 1px solid {c['border']};
             border-radius: 10px;
             margin: 2px;
+        }}
+
+        /* --- Cards: start screen, "please wait" veil ------------------ */
+        QFrame#startCard, QFrame#busyCard {{
+            background-color: {c['panel_bg']};
+            border: 1px solid {c['border']};
+            border-radius: 12px;
+            padding: 8px;
+        }}
+        QFrame#startCard QListWidget::item {{
+            padding: 4px 8px;
+        }}
+        QFrame#startCard QPushButton:checkable:checked {{
+            background-color: {c['accent']};
+            color: {c['accent_text']};
+            border: 1px solid {c['accent']};
+        }}
+        QFrame#busyCard QProgressBar {{
+            border: none;
+            border-radius: 3px;
+            background-color: {c['border']};
+        }}
+        QFrame#busyCard QProgressBar::chunk {{
+            border-radius: 3px;
+            background-color: {c['accent']};
         }}
         ClickToCopyLabel {{
             padding: 6px 8px;
@@ -509,23 +602,48 @@ def apply_theme(app: QApplication, theme: str, text_scale: float = 1.0) -> None:
         ``1.0``.
     """
     app.setStyleSheet(stylesheet(theme, text_scale))
+    _apply_link_color(app, _valid_theme(theme))
 
 
-def _read_settings() -> dict:
+# Color of hyperlinks (help, "Updates"...) by theme. QSS can't style them:
+# rich text takes them from the palette. The light theme keeps Qt's own
+# blue; on the dark theme, that dark blue would be unreadable.
+_LINK_COLORS = {DARK: "#A5B4FC"}
+
+# Qt's own link colors (link, visited link), read once.
+_default_links: tuple[QColor, QColor] | None = None
+
+
+def _apply_link_color(app: QApplication, theme: str) -> None:
     """
-    Read the settings file.
+    Set the color of hyperlinks for a theme, in the application palette.
 
-    Returns
-    -------
-    dict
-        The stored settings, empty if the file is missing, unreadable
-        or not a JSON object.
+    Parameters
+    ----------
+    app : QApplication
+        The application.
+    theme : str
+        A valid theme name.
+
+    Notes
+    -----
+    Only widgets created afterwards pick it up: the help dialog and
+    message boxes are created each time they are shown.
     """
-    try:
-        settings = json.loads(_SETTINGS_FILE_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return settings if isinstance(settings, dict) else {}
+    global _default_links
+    palette = app.palette()
+    if _default_links is None:
+        _default_links = (
+            QColor(palette.color(QPalette.Link)),
+            QColor(palette.color(QPalette.LinkVisited)),
+        )
+    if theme in _LINK_COLORS:
+        link = visited = QColor(_LINK_COLORS[theme])
+    else:
+        link, visited = _default_links
+    palette.setColor(QPalette.Link, link)
+    palette.setColor(QPalette.LinkVisited, visited)
+    app.setPalette(palette)
 
 
 def load_theme() -> str:
@@ -538,7 +656,7 @@ def load_theme() -> str:
         The stored theme, or :data:`DEFAULT_THEME` if none is stored
         or it isn't valid.
     """
-    return _valid_theme(_read_settings().get("theme"))
+    return _valid_theme(read_setting("theme"))
 
 
 def save_theme(theme: str) -> None:
@@ -552,13 +670,6 @@ def save_theme(theme: str) -> None:
 
     Notes
     -----
-    Best effort: a write failure (e.g. read-only home folder) is
-    ignored, the theme just isn't remembered.
+    Best effort (see :mod:`local_settings`).
     """
-    settings = _read_settings()
-    settings["theme"] = _valid_theme(theme)
-    try:
-        _SETTINGS_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _SETTINGS_FILE_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+    write_setting("theme", _valid_theme(theme))

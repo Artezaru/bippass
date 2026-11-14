@@ -59,12 +59,21 @@ def generate_totp_code(
     using SHA1, with no external dependency (standard library only:
     ``hmac``, ``hashlib``, ``struct``, ``base64``).
     """
+    # Normalized in a bytearray, erased right after: the secret never
+    # becomes an immutable str. (The decoded key is a bytes object,
+    # since `hmac` needs one: it can't be erased, but it isn't the
+    # secret as stored and typed.)
+    cleaned = bytearray(c for c in secret if c not in b" \t\r\n")
+    for i, c in enumerate(cleaned):
+        if 0x61 <= c <= 0x7A:  # a-z, uppercased in place
+            cleaned[i] = c - 0x20
+    cleaned += b"=" * ((-len(cleaned)) % 8)
     try:
-        secret_str = bytes(secret).decode("utf-8").strip().replace(" ", "").upper()
-        padding = (-len(secret_str)) % 8
-        key = base64.b32decode(secret_str + "=" * padding)
-    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        key = base64.b32decode(cleaned)
+    except (binascii.Error, ValueError) as exc:
         raise ValueError("Invalid TOTP secret (Base32 expected).") from exc
+    finally:
+        cleaned[:] = bytes(len(cleaned))
 
     now = int(time.time())
     counter = now // period

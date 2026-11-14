@@ -19,44 +19,66 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
 
 import sys
-
-from PyQt5.QtWidgets import QApplication, QDialog
-
-from bippass.GUI import CredentialsWizard
-from bippass.GUI.theme import apply_theme, load_theme
+from typing import Sequence
 
 
-def main() -> None:
+def __main__(argv: Sequence[str] | None = None) -> None:
     """
-    Application entry point: launches the credentials wizard (open an
-    existing vault or create a new one) and, once accepted, hands
-    control over to the main window it built.
+    Command-line entry point: runs the interactive shell.
 
-    Runs via ``python -m bippass`` (this module is ``bippass``'s
-    ``__main__.py``) as well as any console-script entry point
-    declared for the package (e.g. in ``pyproject.toml``, so a
-    PyInstaller build's launcher can import and call this directly).
+    Parameters
+    ----------
+    argv : Sequence of str, optional
+        Command-line arguments (default: :data:`sys.argv` without the
+        program name). An optional profile file path loads it at start.
+
+    Notes
+    -----
+    This is what ``python -m bippass`` runs (this module is
+    ``bippass``'s ``__main__.py``)::
+
+        python -m bippass                       # empty shell
+        python -m bippass test_profile.bippass  # shell with that profile loaded
+
+    It can also be declared as a console-script entry point, e.g. in
+    ``pyproject.toml``: ``bippass = "bippass.__main__:__main__"``.
+
+    Only the command-line interface is imported: PyQt5 is not needed.
     """
+    from bippass.cli import main
+
+    sys.exit(main(argv))
+
+
+def __main_gui__() -> None:
+    """
+    Graphical entry point: opens the main window on its start page
+    (open, create or switch profiles), which then shows the profile.
+
+    Notes
+    -----
+    Not run by ``python -m bippass``, which starts the command-line
+    interface (see :func:`__main__`).
+    It can be declared as a GUI-script entry point, e.g. in
+    ``pyproject.toml``: ``bippass-gui = "bippass.__main__:__main_gui__"``
+    (also what a PyInstaller build's launcher can import and call).
+
+    PyQt5 and the GUI package are imported here, not at module level,
+    so that the command-line interface works without them.
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    from bippass.GUI import PasswordManagerWindow, install_excepthook
+
     app = QApplication(sys.argv)
-
-    # Applies the last chosen theme (light/dark, remembered between
-    # runs -- see theme.py) to the whole application, including every
-    # widget the wizard and the main window create afterwards. The
-    # main window's theme-toggle button switches this later on by
-    # calling `apply_theme` again with the other theme.
-    apply_theme(app, load_theme())
-
-    wizard = CredentialsWizard()
-    if wizard.exec_() != QDialog.Accepted:
-        sys.exit(0)
-
-    # The wizard already built and displayed the PasswordManagerWindow
-    # (see CredentialsWizard._on_finished). Keep a reference here so it
-    # isn't garbage-collected once the wizard object itself is gone.
-    window = wizard.window  # noqa: F841
-
+    # The window applies the last chosen theme itself (see theme.py).
+    window = PasswordManagerWindow()
+    # Unexpected errors: logged and shown instead of stopping the
+    # application (see GUI/crash.py).
+    install_excepthook(window)
+    window.show()
     sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
-    main()
+    __main_gui__()

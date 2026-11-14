@@ -31,48 +31,65 @@ if TYPE_CHECKING:
 
 class MetadataDialog(QDialog):
     """
-    Dialog to edit the manager's account metadata (username).
+    Dialog to edit the profile's username and label.
+
+    Also shows, read-only, the profile's UUID (which names its file)
+    and its dates.
 
     Parameters
     ----------
     manager : PasswordManager
-        Manager whose metadata is edited, read to pre-fill the fields.
+        Unlocked manager whose metadata is edited, read to pre-fill the
+        fields.
     parent : QWidget, optional
         Parent widget.
+
+    Notes
+    -----
+    The username is stored encrypted. The label is the only text
+    readable without a password: it is what the profile list of the
+    start page shows. Either may be left empty.
     """
 
     def __init__(self, manager: PasswordManager, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(translator.translate("metadata.dialog_title"))
-
+        tr = translator.translate
+        self.setWindowTitle(tr("metadata.dialog_title"))
         layout = QFormLayout(self)
 
         self.username_edit = QLineEdit(manager.get_username() or "")
-        layout.addRow(translator.translate("common.username_label"), self.username_edit)
-        layout.addRow(
-            translator.translate("metadata.version_label"), QLabel(str(manager.get_version()))
-        )
+        layout.addRow(tr("common.username_label"), self.username_edit)
+
+        self.label_edit = QLineEdit(manager.label or "")
+        layout.addRow(tr("common.label_label"), self.label_edit)
+        hint = QLabel(tr("metadata.label_hint"))
+        hint.setObjectName("mutedLabel")
+        hint.setWordWrap(True)
+        layout.addRow(hint)
+
+        for label_key, value in (
+            ("metadata.uuid_label", manager.uuid),
+            ("metadata.creation_date_label", manager.creation_date),
+            ("metadata.modification_date_label", manager.modification_date),
+        ):
+            value_label = QLabel(value)
+            value_label.setObjectName("mutedLabel")
+            layout.addRow(tr(label_key), value_label)
 
         layout.addRow(ok_cancel_buttons(self))
 
-    def get_username(self) -> str | None:
-        """
-        Return the entered username.
-
-        Returns
-        -------
-        str or None
-            The username, stripped, or ``None`` if left empty.
-        """
-        return self.username_edit.text().strip() or None
-
     def apply_to(self, manager: PasswordManager) -> None:
         """
-        Write the dialog's fields back into the manager's metadata.
+        Write the dialog's fields back into the manager.
 
         Parameters
         ----------
         manager : PasswordManager
-            Manager to update. An empty username is stored as ``None``.
+            Manager to update. Empty fields are stored as ``None``.
         """
-        manager.set_username(self.get_username())
+        username = self.username_edit.text().strip() or None
+        label = self.label_edit.text().strip() or None
+        if username != manager.get_username():
+            manager.set_username(username)
+        if label != manager.label:
+            manager.set_label(label)

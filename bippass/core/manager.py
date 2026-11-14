@@ -18,1860 +18,1198 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
-import base64
-import binascii
-import copy
 import json
 import os
-import threading
-import uuid
 from pathlib import Path
-from typing import cast
-
-from .exceptions import (
-    VaultNotFoundError,
-    VaultAlreadyExistsError,
-    ItemAlreadyExistsError,
-    PasswordManagerError,
-    PrimaryPasswordError,
-    SecondaryPasswordError,
-    CorruptedBase64Error,
-)
-from .types import PasswordManagerData, Metadata, ClearString, CryptedBase64String
+from typing import Any, Iterable, Literal, cast
 
 import pyaescbc
 
-from .vault import Vault
-from .item import Item
+from .types import ClearString, PayloadData, PreferencesData
+from .exceptions import (
+    CorruptedBase64Error, CorruptedFileError, ItemAlreadyExistsError,
+    ItemNotFoundError, PrimaryPasswordError, SecondaryPasswordError,
+    TamperedDataError, UnsupportedVersionError, VaultAlreadyExistsError,
+    VaultNotFoundError, WrongPasswordError,
+)
+from .common import (
+    _now, _b64decode, _b64encode, _check_date, _check_keys,
+    _check_lock_timer, _check_optional_name, _check_optional_str, _sort_items,
+)
 from .credentials import Credentials
+from .datakey import DataKey
+from .item import Item
+from .vault import Vault
+from .uuids import UUIDError, _check_uuid, _check_unique_uuids, _generate_uuid, _get_uuid_index
+
+
+#: Value of the ``"format"`` key of every bippass file.
+FORMAT_NAME = "bippass"
+
+#: File format version written by this software.
+FORMAT_VERSION = 3
+
+#: Prefix of the authenticated data of the encrypted payload. Binds the
+#: payload to this format version: a payload can never be read as
+#: another version. NEVER change it: existing files could no longer be
+#: decrypted.
+_PAYLOAD_AUTHDATA = b"bippass::payload::v3"
+
+#: Keys accepted in each section of the serialized data.
+_ENVELOPE_KEYS = ("format", "version", "label", "primary_key", "payload")
+_PAYLOAD_KEYS = ("metadata", "secondary_key", "vaults", "preferences")
+_METADATA_KEYS = ("uuid", "username", "creation_date", "modification_date")
+_PREFERENCES_KEYS = ("theme", "language", "lock_timer_s")
+
+#: Value of every preference absent from a file.
+_DEFAULT_PREFERENCES: PreferencesData = {
+    "theme": "dark",
+    "language": "en",
+    "lock_timer_s": 300,
+}
+
+
+def _payload_authdata(label: str | None) -> bytearray:
+    """
+    Build the authenticated data of the payload.
+
+    Returns
+    -------
+    bytearray
+        ``bippass::payload::v3|<label as JSON>``: the label is
+        authenticated together with the payload, so that changing it in
+        the envelope makes the file fail to decrypt. JSON encoding keeps
+        ``None`` and ``""`` distinct.
+    """
+    return bytearray(_PAYLOAD_AUTHDATA + b"|" + json.dumps(label).encode("utf-8"))
 
 
 class PasswordManager:
-    """Manage encrypted password vaults and their credentials.
+    """
+    Manage an encrypted password file: its vaults, items and keys.
 
-    ``PasswordManager`` is the top-level object responsible for managing
-    :class:`Vault` instances, maintaining global item UUID uniqueness,
-    handling the primary encryption credentials, and validating the
-    secondary encryption credentials.
+    ``PasswordManager`` is the top-level object of bippass. It reads and
+    writes a profile file, unlocks it with the primary and secondary
+    passwords, owns the :class:`Vault` instances, guarantees that item
+    UUIDs are unique across every vault, and handles password changes
+    and the exchange of items between profiles.
 
-    Construction is deliberately inert: creating a
-    :class:`PasswordManager` only stores its raw (still encrypted)
-    ``data`` and its :class:`Credentials`, without decrypting anything.
-    Actually decrypting the data and building the vaults is
-    :meth:`decrypt_data`'s job; verifying the secondary credentials is
-    :meth:`check_secondary`'s. See their docstrings, and :meth:`__init__`'s
-    Notes, for why they are split out like this.
-
-    Parameters
-    ----------
-    data : bytearray
-        Encrypted password manager bundle produced by :meth:`encrypt`.
-        Not touched until :meth:`decrypt_data` is called.
-
-    credentials : Credentials
-        Holds both the primary password/iteration pair (used by
-        :meth:`decrypt_data`) and the secondary one (used by
-        :meth:`check_secondary` and every encrypted item field
-        operation thereafter).
-
-
-    Raises
-    ------
-    TypeError
-        If ``data`` is not a :class:`bytearray` or ``credentials`` is
-        not a :class:`Credentials` instance.
-
+    Instances are not created directly: use :meth:`read` (or
+    :meth:`from_bytes`) to open an existing file, or :meth:`create` to
+    start a new one.
 
     Notes
     -----
-    ``credentials`` is stored by reference: the manager does not
-    create its own :class:`Credentials` instance, and does not copy
-    or wipe its password on a per-call basis (see :class:`Item`'s
-    class-level docstring for why that matters). Only
-    :meth:`close` (via :meth:`Credentials.clear`) erases it.
+    **File format (version 3).** A file is a small JSON *envelope*,
+    whose only encrypted part is the ``payload``::
 
-    Item UUIDs are not stored separately by the manager: they are
-    derived on demand from the vaults' items (see :attr:`uuids`), so
-    they can never drift out of sync with the actual items even if a
-    :class:`Vault` is modified directly.
+        {
+            "format":      "bippass",
+            "version":     3,
+            "label":       "<display name, or null>",
+            "primary_key": "<file key, wrapped by the primary password>",
+            "payload":     "<content, encrypted with the file key>"
+        }
 
-    Every method that reads or mutates :attr:`_vaults` (directly or
-    through a :class:`Vault`) acquires :attr:`_lock`, a re-entrant
-    lock, before doing so. This makes it safe to call, for instance,
-    :meth:`save_changes` from a background thread while the UI thread
-    concurrently edits an item, adds a vault, or otherwise mutates the
-    manager, see :meth:`save_changes` for the intended usage.
+    and the decrypted payload is::
 
+        {
+            "metadata":      {"uuid", "username", "creation_date", "modification_date"},
+            "secondary_key": "<data key, wrapped by the secondary password>",
+            "vaults":        [{vault}, {vault}, ...],
+            "preferences":   {"theme", "language", "lock_timer_s"}
+        }
+
+    Binary values are Base64-encoded. The format, version and label are
+    readable without any password, so that the right reading code can
+    be chosen, and a profile picker can show the profile, before
+    anything is asked to the user (see :meth:`from_bytes`). The payload
+    is authenticated together with its format version and the label.
+
+    **Label.** The label is the only piece of content readable without
+    a password: a display name for profile pickers (see
+    :mod:`profiles`), chosen by the user, who may leave it ``None`` to
+    keep the profile anonymous. It is independent of the username,
+    which is only stored inside the encrypted payload.
+
+    **Two keys, two layers** (see :class:`Credentials`):
+
+    - the **primary** password only unwraps the *file key*, which
+      decrypts the payload: everything but the sensitive values
+      (vault and item names, logins, websites, ...);
+    - the **secondary** password only unwraps the *data key*, which
+      decrypts the sensitive values (passwords, TOTP secrets, encrypted
+      custom fields).
+
+    The slow PBKDF2 derivation of a password (see
+    :attr:`Credentials.PRIMARY_ITERATIONS`) therefore only happens when
+    unlocking or changing that password. Saving only uses the file key:
+    it takes milliseconds, and does not need the data key.
+
+    **Lifecycle.** The same verbs as the interfaces, so that a caller
+    can report each kind of failure distinctly and in order::
+
+        manager = PasswordManager.read(path)  # CorruptedFileError, UnsupportedVersionError
+        manager.unlock(primary)               # PrimaryPasswordError
+        manager.decrypt(secondary)            # SecondaryPasswordError
+        ...
+        manager.encrypt()                     # forget the data key
+        manager.save(path)
+        manager.close()                       # erases both keys, irreversibly
+
+    Locking a profile is not a state of the manager: the interfaces
+    lock by saving and closing it, and read the file again to reopen it.
+
+    ===========  ===================  ==========================================
+    State        Reached by           What is available
+    ===========  ===================  ==========================================
+    locked       :meth:`read`         the label only
+    unlocked     :meth:`unlock`       vaults, items, clear fields, metadata
+    decrypted    :meth:`decrypt`      the data key, to decrypt secrets on demand
+    closed       :meth:`close`        nothing
+    ===========  ===================  ==========================================
+
+    :meth:`unlock` really decrypts something: the file content, which
+    then stays in memory. :meth:`decrypt` decrypts no secret: it only
+    unwraps the data key, with which each secret can then be decrypted
+    when asked for (see :meth:`Item.get` with ``data_key``), and erased
+    right after. Symmetrically, :meth:`encrypt` re-encrypts nothing: it
+    forgets the data key, since secrets are never held in clear. Methods
+    called too early raise :class:`RuntimeError`.
+
+    **Passwords** are given as ``bytearray`` and erased as soon as they
+    have been used, whether the operation succeeds or not: the caller
+    must not reuse a password ``bytearray`` after passing it.
+
+    **Data key.** Always obtain the data key from :attr:`data_key` right
+    before using it, never keep it: :meth:`change_secondary_password`
+    replaces it and erases the previous one.
+
+    **Uniqueness.** Item UUIDs are unique across every vault of the
+    manager; vault UUIDs are unique among vaults. Several vaults (or
+    items) may share the same name.
+
+    **Order.** Neither vaults nor items have an order chosen by the
+    user: :meth:`get_vaults` returns the vaults sorted by name, and
+    interfaces show the items of a vault sorted too (see
+    :meth:`Vault.sorted_items`).
+
+    **Dates.** :attr:`modification_date` records changes to the manager
+    itself: changing the username, the label or a password, adding or
+    removing a vault. Changing preferences, and any change made inside
+    a vault or an item, do not update it.
+
+    **Threads.** This class performs no locking. Every method is meant
+    to be called from one thread (typically the GUI thread). To save
+    without blocking that thread, split :meth:`save` in two: call
+    :meth:`to_bytes` in the GUI thread (fast: it only serializes and
+    encrypts with the file key), then hand the returned bytes to
+    :meth:`write_file` in a worker thread. :meth:`write_file` touches
+    nothing but its arguments, so it is safe to run concurrently with
+    any further change to the manager.
+
+    The textual representation of a manager (:func:`repr`, :func:`str`)
+    only shows its state and vault count, so it stays safe to print or
+    log.
 
     See Also
     --------
-    Vault
-        Container for password items.
-
-    Item
-        Individual password vault item.
-
     Credentials
-        Holds the primary and secondary password/iteration pairs.
+        Holds the file key and the data key of an unlocked manager.
+
+    Vault, Item
+        The content of the manager.
     """
 
-    _AUTH_MESSAGE: bytes = (
-        b"PasswordManager::secondary-password-check::v1"
-    )
-
-    _DEFAULT_METADATA: Metadata = {
-        "version": 1,
-        "username": None,
-        "theme": "dark",
-        "language": "en",
-        "close_timer_s": 300,
-    }
-
-    def __init__(
-        self,
-        data: bytearray,
-        credentials: Credentials,
-    ) -> None:
-        """Store the manager's raw data and credentials.
-
-        Parameters
-        ----------
-        data : bytearray
-            Encrypted password manager bundle.
-
-        credentials : Credentials
-            Holds the primary and secondary password/iteration pairs.
-
-        Raises
-        ------
-        TypeError
-            If ``data`` is not a :class:`bytearray` or ``credentials``
-            is not a :class:`Credentials` instance.
+    def __init__(self) -> None:
+        """
+        Create a blank, locked manager (internal).
 
         Notes
         -----
-        Nothing is decrypted and no vault is built here:
-        :attr:`_vaults` starts out as ``None``, and every method that
-        needs it raises a clear :class:`RuntimeError` until
-        :meth:`decrypt_data` has been called (see
-        :meth:`_require_decrypted`).
-
-        Splitting construction (this method), decryption
-        (:meth:`decrypt_data`), and secondary-credential verification
-        (:meth:`check_secondary`) into three separate steps lets a
-        caller, typically a GUI unlock dialog, report each kind of
-        failure distinctly and in order: "file unreadable" before
-        even reaching here, then "wrong primary password" from
-        :meth:`decrypt_data`, then "wrong secondary password" from
-        :meth:`check_secondary`, instead of one opaque failure out of
-        a single all-in-one constructor.
+        Use :meth:`read`, :meth:`from_bytes` or :meth:`create` instead.
         """
-        if not isinstance(data, bytearray):
-            raise TypeError(f"data must be bytearray, not {type(data)}")
-        if not isinstance(credentials, Credentials):
-            raise TypeError(
-                f"credentials must be Credentials, not {type(credentials)}"
-            )
+        self._credentials: Credentials = Credentials()
+        self._wrapped_file_key: bytearray | None = None
+        self._encrypted_payload: bytearray | None = None
+        self._wrapped_data_key: bytearray | None = None
 
-        # Re-entrant so that a locked method can freely call another
-        # locked method on the same thread
-        self._lock: threading.RLock = threading.RLock()
-
-        self._data: bytearray = data
-        self._credentials: Credentials = credentials
-
-        self._metadata: Metadata | None = None
-        self._auth: CryptedBase64String | None = None
-        self._vaults: dict[str, Vault] | None = None
-
-    @classmethod
-    def _with_metadata_defaults(cls, metadata: Metadata) -> Metadata:
-        """
-        Fill in any :class:`Metadata` key missing from ``metadata``
-        with its default value from :attr:`_DEFAULT_METADATA`.
-
-        Parameters
-        ----------
-        metadata : Metadata
-            Metadata as decrypted, or as supplied to :meth:`new`,
-            possibly missing keys added by a later software version.
-
-        Returns
-        -------
-        Metadata
-            A new dict: every key already present in ``metadata``
-            (including an explicit ``None``) is kept as-is; every
-            missing key is set to its default.
-        """
-        return {**cls._DEFAULT_METADATA, **metadata}
-
-    @classmethod
-    def new(cls, metadata: Metadata, credentials: Credentials) -> PasswordManager:
-        """
-        Create a brand-new, empty password manager.
-
-        Unlike the normal constructor, which expects previously
-        encrypted ``data`` that :meth:`decrypt_data` will later
-        decrypt, this is for starting a manager from scratch, no
-        file exists yet.
-
-        Parameters
-        ----------
-        metadata : Metadata
-            Initial manager metadata (e.g. username, format version).
-            Any key it omits is filled in with its default (see
-            :meth:`_with_metadata_defaults`).
-
-        credentials : Credentials
-            Holds the primary and secondary password/iteration pairs
-            this manager will encrypt and decrypt with.
-
-        Returns
-        -------
-        PasswordManager
-            A new manager with no vaults, ready to use immediately,
-            there is nothing to decrypt or authenticate, so neither
-            :meth:`decrypt_data` nor :meth:`check_secondary` needs to
-            be called.
-
-        Raises
-        ------
-        TypeError
-            If ``metadata`` is not a ``dict`` or ``credentials`` is
-            not a :class:`Credentials` instance.
-
-        Notes
-        -----
-        Bypasses :meth:`decrypt_data` entirely: :attr:`_vaults` is
-        set directly to an empty dict, and :attr:`_data` is left as
-        an empty placeholder (it is only ever read by
-        :meth:`decrypt_data`, which this manager will never need to
-        call).
-
-        :attr:`_auth` is left as ``None``: a valid auth value is
-        derived from ``credentials`` the next time this manager is
-        serialized (:meth:`to_dict`/:meth:`encrypt`), exactly as for
-        :meth:`_from_unencrypted_bundle`. Calling
-        :meth:`check_secondary` on a manager created this way would
-        raise, since there is nothing yet to check it against, which
-        is expected: the caller just handed these credentials over
-        directly, there's no stored auth value to be wrong about.
-
-        ``credentials`` need not have its primary/secondary passwords
-        set yet at the time this is called: since it is stored by
-        reference, a caller may build an empty :class:`Credentials`,
-        pass it here, and fill in
-        :meth:`Credentials.set_primary_password`/
-        :meth:`Credentials.set_secondary_password` afterwards, useful
-        for a step-by-step "create a new vault" GUI flow where the
-        file (and thus this manager) is chosen before the passwords
-        are.
-        """
-        if not isinstance(metadata, dict):
-            raise TypeError(f"metadata must be a dict, not {type(metadata)}")
-        if not isinstance(credentials, Credentials):
-            raise TypeError(
-                f"credentials must be Credentials, not {type(credentials)}"
-            )
-
-        instance = cls(bytearray(), credentials)
-        instance._metadata = cls._with_metadata_defaults(metadata)
-        instance._vaults = {}
-        return instance
-
-    def _require_decrypted(self) -> None:
-        """
-        Raise a clear error if :meth:`decrypt_data` has not run yet.
-
-        Raises
-        ------
-        RuntimeError
-            If :attr:`_vaults` is still ``None``.
-
-        Notes
-        -----
-        Called at the top of every method that reads or mutates
-        :attr:`_vaults` or :attr:`_metadata` directly. Methods that
-        only reach those through another guarded method (e.g.
-        :meth:`get_item` through :meth:`get_vault`) do not need to
-        call this themselves: the guard is hit transitively, with the
-        same clear message.
-        """
-        if self._vaults is None:
-            raise RuntimeError(
-                "PasswordManager data has not been decrypted yet; "
-                "call decrypt_data() first."
-            )
-
-    def _load_manager_data(self, manager_data: PasswordManagerData) -> None:
-        """
-        Populate metadata, the stored auth value, and vaults.
-
-        Parameters
-        ----------
-        manager_data : PasswordManagerData
-            Deserialized password manager data, as produced by
-            :meth:`_decrypt` (for :meth:`decrypt_data`) or by
-            ``json.loads`` directly on an already-cleartext bundle
-            (for :meth:`_from_unencrypted_bundle`).
-
-        Notes
-        -----
-        Does not itself acquire :attr:`_lock`; every caller is
-        responsible for that.
-        """
-        self._metadata = self._with_metadata_defaults(manager_data["metadata"])
-        self._auth = manager_data["auth"]
-        self._vaults = {
-            name: Vault(name, vault_data)
-            for name, vault_data in manager_data["vaults"].items()
-        }
-
-    def decrypt_data(self) -> None:
-        """
-        Decrypt the manager's stored data and build its vaults.
-
-        Uses the primary password and iteration count held by
-        :attr:`_credentials` to decrypt :attr:`_data`, then populates
-        the manager's metadata and vaults from the result.
-
-        Raises
-        ------
-        RuntimeError
-            If this method has already been called: calling it again
-            would silently discard the in-memory vaults (and any
-            unsaved change made to them) built by the first call.
-
-        PrimaryPasswordError
-            If the primary credentials are invalid.
-
-        ValueError
-            If the decrypted data is not a valid password manager
-            structure.
-
-        Notes
-        -----
-        Every method that reads or mutates vaults or metadata (e.g.
-        :meth:`get_vault`, :meth:`to_dict`) requires this to have run
-        first, see :meth:`_require_decrypted`.
-
-        Does not itself verify the secondary credentials: call
-        :meth:`check_secondary` afterwards for that.
-        """
-        with self._lock:
-            if self._vaults is not None:
-                raise RuntimeError(
-                    "decrypt_data() has already been called; calling "
-                    "it again would discard any changes made since."
-                )
-            manager_data = self._decrypt(self._data)
-            self._load_manager_data(manager_data)
-
-    def check_secondary(self) -> None:
-        """
-        Verify the secondary password and iteration count.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
-
-        CorruptedBase64Error
-            If the stored authentication value is not valid Base64.
-
-        SecondaryPasswordError
-            If the secondary credentials are invalid.
-
-        Notes
-        -----
-        Deliberately separate from :meth:`decrypt_data`, so a caller
-        can choose whether, and when, to validate the secondary
-        credentials. :meth:`_from_unencrypted_bundle`, for instance,
-        never calls this: the unencrypted bundle it imports is not
-        expected to carry a meaningful ``auth`` value yet (a fresh one
-        is generated the next time the manager is serialized).
-        """
-        with self._lock:
-            if self._auth is None:
-                raise RuntimeError(
-                    "decrypt_data() must be called before check_secondary()."
-                )
-            self._check_secondary_credentials(self._auth)
-
-    @classmethod
-    def _from_unencrypted_bundle(
-        cls,
-        data: bytearray,
-        credentials: Credentials,
-        unencrypted_secrets: bool = True,
-    ) -> PasswordManager:
-        """
-        Create a password manager from an unencrypted JSON bundle.
-
-        This method is intended for importing password manager data from
-        an unencrypted JSON representation. The sensitive fields stored in
-        each :class:`Item` are considered to contain cleartext values,
-        despite using the ``CryptedBase64String`` representation internally.
-
-        After the manager has been created, all sensitive item fields are
-        encrypted using ``credentials``' secondary password and iteration
-        count.
-
-        The secondary authentication value stored in the unencrypted bundle
-        is not validated, :meth:`check_secondary` is simply never called
-        here. A new authentication value is generated automatically when
-        the resulting manager is serialized.
-
-        Parameters
-        ----------
-        data : bytearray
-            UTF-8 encoded JSON bundle containing the unencrypted password
-            manager data.
-
-        credentials : Credentials
-            Holds the primary password/iteration pair used to encrypt the
-            resulting bundle (see :meth:`encrypt`) and the secondary one
-            used to encrypt every sensitive item field.
-
-        unencrypted_secrets : bool
-            If True, sensitive fields stored in
-            each :class:`Item` are considered to contain cleartext values
-            and will be encrypted by the credentials.
-
-        Returns
-        -------
-        PasswordManager
-            Password manager initialized from the unencrypted bundle, with
-            all sensitive item fields encrypted using ``credentials``.
-
-        Raises
-        ------
-        TypeError
-            If ``data`` is not a :class:`bytearray` or ``credentials`` is
-            not a :class:`Credentials` instance.
-
-        ValueError
-            If ``data`` does not contain valid password manager JSON data.
-
-        Warning
-        -------
-        This method is intended for importing trusted unencrypted bundles.
-        The input contains sensitive information in cleartext and should be
-        handled accordingly.
-
-        Notes
-        -----
-        Unlike :meth:`decrypt_data`, the bundle here is not
-        primary-encrypted yet, so it is parsed directly with
-        ``json.loads`` rather than through :meth:`_decrypt`.
-        """
-        instance = cls(data, credentials)
-
-        try:
-            manager_data: object = json.loads(data.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("Invalid unencrypted password manager data.") from exc
-        if not isinstance(manager_data, dict):
-            raise ValueError(
-                "The unencrypted password manager bundle must be a JSON object."
-            )
-
-        instance._load_manager_data(cast(PasswordManagerData, manager_data))
-
-        if unencrypted_secrets:
-            for vault in instance._vaults.values():
-                for item in vault._items.values():
-                    item._force_encrypt(instance._credentials)
-
-        return instance
-
-    def _to_unencrypted_bundle(self, unencrypted_secrets: bool = True) -> bytearray:
-        """
-        Export the password manager as an unencrypted JSON bundle.
-
-        This method decrypts all sensitive fields contained in the manager's
-        items and serializes the complete manager as UTF-8 encoded JSON.
-
-        The returned JSON contains the password manager metadata, vaults,
-        items, and sensitive values in cleartext. It is therefore intended
-        primarily for exporting, backup, migration, or interoperability
-        purposes and must be handled as sensitive data.
-
-        Parameters
-        ----------
-        unencrypted_secrets : bool
-            If True, sensitive fields stored in
-            each :class:`Item` will be decrypted by the credentials.
-
-        Returns
-        -------
-        bytearray
-            UTF-8 encoded JSON representation of the password manager with
-            sensitive item fields stored as cleartext values.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
-
-        Warning
-        -------
-        The returned bundle contains passwords, TOTP secrets, and other
-        sensitive information in cleartext. It must not be stored or
-        transmitted without appropriate protection.
-
-        Notes
-        -----
-        The returned bundle is not encrypted with the primary password.
-
-        This method permanently decrypts every item in place (via
-        :meth:`Item._force_decrypt`): it mutates the manager's own
-        state, it does not operate on a copy. It is guarded by
-        :attr:`_lock` for that reason.
-
-        See Also
-        --------
-        _from_unencrypted_bundle
-            Create a password manager from an unencrypted JSON bundle.
-        """
-        with self._lock:
-            self._require_decrypted()
-
-            if unencrypted_secrets:
-                for vault in self._vaults.values():
-                    for item in vault._items.values():
-                        item._force_decrypt(self._credentials)
-
-            dict_repr = self.to_dict()
-            dict_repr['auth'] = ""
-
-            return bytearray(json.dumps(dict_repr, ensure_ascii=False, indent=4).encode("utf-8"))
+        self._label: ClearString | None = None
+        self._uuid: str | None = None
+        self._username: ClearString | None = None
+        self._creation_date: str | None = None
+        self._modification_date: str | None = None
+        self._vaults: list[Vault] | None = None
+        self._preferences: PreferencesData = cast(PreferencesData, dict(_DEFAULT_PREFERENCES))
+        self._closed: bool = False
 
     # ----------------
-    # Encryption
+    # Opening and creation
     # ----------------
 
-    def _decrypt(self, data: bytearray) -> PasswordManagerData:
-        """Decrypt and deserialize the password manager data.
-
-        Parameters
-        ----------
-        data : bytearray
-            Encrypted password manager bundle.
-
-        Returns
-        -------
-        PasswordManagerData
-            Deserialized password manager data.
-
-        Raises
-        ------
-        PrimaryPasswordError
-            If the primary credentials are invalid.
-
-        ValueError
-            If the decrypted content is not valid UTF-8, valid JSON,
-            or does not contain the required top-level fields.
-        """
-        try:
-            clear_data: bytearray = pyaescbc.decrypt(
-                data,
-                bytearray(self._credentials.get_primary_password()),
-                delete_keys=True,
-                delete_data=True,
-            )
-        except pyaescbc.AuthError as exc:
-            raise PrimaryPasswordError(
-                "Wrong primary password."
-            ) from exc
-
-        try:
-            manager_data: object = json.loads(clear_data.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                "Invalid decrypted password manager data."
-            ) from exc
-
-        if not isinstance(manager_data, dict):
-            raise ValueError(
-                "The decrypted password manager must be a JSON object."
-            )
-
-        required_fields: tuple[str, ...] = ("metadata", "auth", "vaults")
-        missing_fields: list[str] = [
-            field for field in required_fields if field not in manager_data
-        ]
-        if missing_fields:
-            raise ValueError(
-                f"Missing password manager fields: {missing_fields}"
-            )
-
-        return cast(PasswordManagerData, manager_data)
-
-    def _check_secondary_credentials(self, auth: CryptedBase64String) -> None:
-        """Validate the secondary password.
-
-        Parameters
-        ----------
-        auth : CryptedBase64String
-            Base64-encoded encrypted authentication value stored in
-            the password manager data.
-
-        Raises
-        ------
-        CorruptedBase64Error
-            If ``auth`` is not valid Base64.
-
-        SecondaryPasswordError
-            If the secondary password is invalid.
-        """
-        try:
-            encrypted_auth: bytearray = bytearray(
-                base64.b64decode(auth, validate=True)
-            )
-        except binascii.Error as exc:
-            raise CorruptedBase64Error(
-                "Corrupted password manager data: invalid Base64 encoding."
-            ) from exc
-
-        try:
-            clear_auth: bytearray = pyaescbc.decrypt(
-                encrypted_auth,
-                bytearray(self._credentials.get_secondary_password()),
-                delete_keys=True,
-                delete_data=True,
-            )
-        except pyaescbc.AuthError as exc:
-            raise SecondaryPasswordError(
-                "Invalid secondary password."
-            ) from exc
-
-        if clear_auth != self._AUTH_MESSAGE:
-            raise SecondaryPasswordError("Invalid secondary password.")
-
-    def _create_auth(self) -> CryptedBase64String:
-        """Create the secondary credential verification value.
-
-        Returns
-        -------
-        CryptedBase64String
-            Base64-encoded encrypted authentication value.
-
-        Notes
-        -----
-        Thin wrapper around :meth:`create_auth` using this manager's
-        own credentials, so there is only one place (that classmethod)
-        that ever turns a secondary password/iteration pair into an
-        ``auth`` value.
-        """
-        return self.create_auth(self._credentials)
-
     @classmethod
-    def create_auth(cls, credentials: Credentials) -> CryptedBase64String:
-        """Create a secondary credential verification value.
-
-        Useful when creating a new password manager before it has
-        been serialized for the first time.
-
-        Parameters
-        ----------
-        credentials : Credentials
-            Holds the secondary password and iteration count to
-            encrypt the authentication value with.
-
-        Returns
-        -------
-        CryptedBase64String
-            Base64-encoded encrypted authentication value.
-
-        Raises
-        ------
-        TypeError
-            If ``credentials`` is not a :class:`Credentials` instance.
-
-        Notes
-        -----
-        Reads the secondary password straight from ``credentials``
-        (:meth:`Credentials.get_secondary_password`), and the
-        iteration count is always
-        :attr:`Credentials.SECONDARY_ITERATIONS` -- a fixed constant
-        now rather than anything derived per-password, so there is no
-        way for this value to drift from what
-        :meth:`_check_secondary_credentials` later checks against.
+    def read(cls, path: str | Path) -> PasswordManager:
         """
-        if not isinstance(credentials, Credentials):
-            raise TypeError(
-                f"credentials must be Credentials, not {type(credentials)}"
-            )
-
-        encrypted_auth: bytearray = pyaescbc.encrypt(
-            bytearray(cls._AUTH_MESSAGE),
-            bytearray(credentials.get_secondary_password()),
-            iterations=credentials.get_secondary_iterations(),
-            delete_keys=True,
-            delete_data=True,
-        )
-        return base64.b64encode(encrypted_auth).decode("ascii")
-
-    def encrypt(self) -> bytearray:
-        """Encrypt the complete password manager.
-
-        Returns
-        -------
-        bytearray
-            Encrypted password manager bundle suitable for storage.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`to_json`/:meth:`to_dict`).
-
-        Notes
-        -----
-        Guarded by :attr:`_lock` so the serialized snapshot (produced
-        by :meth:`to_json`) reflects a single consistent state, even
-        if another thread is concurrently mutating a vault or an item.
-        """
-        with self._lock:
-            clear_data: bytearray = bytearray(self.to_json().encode("utf-8"))
-            primary_password = bytearray(self._credentials.get_primary_password())
-            primary_iterations = self._credentials.get_primary_iterations()
-        return pyaescbc.encrypt(
-            clear_data,
-            primary_password,
-            iterations=primary_iterations,
-            delete_keys=True,
-            delete_data=True,
-        )
-
-    def save_changes(self, path: str | Path) -> None:
-        """
-        Encrypt the current state of the manager and write it to disk.
+        Open a file, without unlocking it.
 
         Parameters
         ----------
         path : str or Path
-            Destination file. Created if it does not exist yet,
-            overwritten if it does.
+            File to read.
+
+        Returns
+        -------
+        PasswordManager
+            A locked manager: call :meth:`unlock` next.
+
+        Raises
+        ------
+        OSError
+            If the file cannot be read.
+
+        CorruptedFileError, UnsupportedVersionError
+            See :meth:`from_bytes`.
+        """
+        return cls.from_bytes(Path(path).read_bytes())
+
+    @classmethod
+    def from_bytes(cls, data: bytes | bytearray) -> PasswordManager:
+        """
+        Open the content of a file, without unlocking it.
+
+        Parameters
+        ----------
+        data : bytes or bytearray
+            Content of a bippass file. Not modified.
+
+
+        Returns
+        -------
+        PasswordManager
+            A locked manager: call :meth:`unlock` next.
+
+
+        Raises
+        ------
+        TypeError
+            If ``data`` is neither ``bytes`` nor ``bytearray``.
+
+        UnsupportedVersionError
+            If the file is a valid bippass file of another format
+            version (including version 1 files, which were a raw
+            password-mode bundle with no envelope).
+
+        CorruptedFileError
+            If ``data`` is not a bippass file, or its envelope is
+            malformed.
+
+
+        Notes
+        -----
+        No password is needed nor asked here: only the unencrypted
+        envelope is read, which is enough to tell the format version.
+        Older formats are not read.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError(f"data must be bytes or bytearray, not {type(data)}")
+
+        if bytes(data[:4]) == b"PACB":
+            raise UnsupportedVersionError(
+                "This is a version 1 bippass file: it must be converted first."
+            )
+
+        try:
+            envelope = json.loads(bytes(data).decode("utf-8"))
+            envelope = _check_keys("file envelope", envelope, _ENVELOPE_KEYS)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise CorruptedFileError("Not a valid bippass file.") from exc
+
+        if envelope.get("format") != FORMAT_NAME:
+            raise CorruptedFileError("Not a bippass file.")
+        version = envelope.get("version")
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise CorruptedFileError("Invalid format version.")
+        if version != FORMAT_VERSION:
+            raise UnsupportedVersionError(
+                f"Format version {version} is not supported "
+                f"(this software reads version {FORMAT_VERSION})."
+            )
+
+        try:
+            label = _check_optional_name("label", envelope.get("label"))
+            wrapped_file_key = _b64decode("primary_key", envelope.get("primary_key"))
+            payload = _b64decode("payload", envelope.get("payload"))
+        except (TypeError, CorruptedBase64Error) as exc:
+            raise CorruptedFileError("Corrupted file envelope.") from exc
+
+        manager = cls()
+        manager._label = label
+        manager._wrapped_file_key = wrapped_file_key
+        manager._encrypted_payload = payload
+        return manager
+
+    @classmethod
+    def create(
+        cls,
+        username: ClearString | None,
+        primary_password: bytearray,
+        secondary_password: bytearray,
+        *,
+        label: ClearString | None = None,
+    ) -> PasswordManager:
+        """
+        Create a new, empty, fully unlocked manager.
+
+        Parameters
+        ----------
+        username : ClearString or None
+            Username of the new profile, stored encrypted. Stripped;
+            blank means none.
+
+        primary_password : bytearray
+            Primary password. Erased once used.
+
+        secondary_password : bytearray
+            Secondary password. Erased once used.
+
+        label : ClearString or None, optional
+            Display name readable without any password (keyword-only,
+            see the class-level Notes). Stripped. ``None`` (the default),
+            or a blank label, keeps the profile anonymous; a GUI would
+            typically propose the username.
+
+
+        Returns
+        -------
+        PasswordManager
+            A manager with no vault, unlocked and decrypted. Nothing is
+            written to disk until :meth:`save` is called.
+
+
+        Raises
+        ------
+        TypeError
+            If ``username`` or ``label`` is neither a ``str`` nor
+            ``None``, or a password is not a ``bytearray``.
+
+        ValueError
+            If a password is empty.
+
+
+        Notes
+        -----
+        Slow by design: both passwords go through a full PBKDF2
+        derivation (see :class:`Credentials`). A fresh random file key
+        and data key are generated.
+        """
+        username = _check_optional_name("username", username)
+        label = _check_optional_name("label", label)
+        manager = cls()
+        manager._label = label
+        file_key, data_key = DataKey.random(), DataKey.random()
+        try:
+            manager._wrapped_file_key = file_key.wrap(
+                primary_password, Credentials.PRIMARY_ITERATIONS, purpose="file"
+            )
+            manager._wrapped_data_key = data_key.wrap(
+                secondary_password, Credentials.SECONDARY_ITERATIONS, purpose="data"
+            )
+        except BaseException:
+            file_key.clear()
+            data_key.clear()
+            for password in (primary_password, secondary_password):
+                if isinstance(password, bytearray):
+                    pyaescbc.delete_bytearray(password)
+            raise
+
+        manager._credentials.set_file_key(file_key)
+        manager._credentials.set_data_key(data_key)
+        manager._uuid = _generate_uuid(())
+        manager._username = username
+        now = _now()
+        manager._creation_date = now
+        manager._modification_date = now
+        manager._vaults = []
+        return manager
+
+    # ----------------
+    # Unlocking
+    # ----------------
+
+    def unlock(self, password: bytearray) -> None:
+        """
+        Unlock the profile: decrypt the file content with the primary password.
+
+        Parameters
+        ----------
+        password : bytearray
+            Primary password. Erased once used, even if wrong.
+
 
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`encrypt`).
+            If the profile is already unlocked, or the manager is closed.
 
-        OSError
-            If the encrypted bundle cannot be written to ``path``.
+        PrimaryPasswordError
+            If ``password`` is wrong.
+
+        TamperedDataError
+            If the password is right but the payload fails
+            authentication (the file, or its label, has been modified).
+
+        CorruptedFileError
+            If the decrypted payload is not valid bippass data.
+
 
         Notes
         -----
-        This is the method meant to be called after any change to the
-        manager's state, saving an item from :class:`ItemViewer`,
-        creating/renaming/removing a vault, adding/deleting/moving an
-        item, or shutting the application down, and it is safe to
-        call from a background thread: :meth:`encrypt` (which this
-        method calls) takes :attr:`_lock` internally to obtain a
-        consistent snapshot, so it can run concurrently with, e.g.,
-        the UI thread editing another item. Once the snapshot has been
-        encrypted, the actual disk write happens outside the lock so
-        that slow I/O never blocks other threads from mutating the
-        manager in the meantime; the on-disk file will simply reflect
-        whichever snapshot was current at the moment :meth:`encrypt`
-        was called.
+        On success, vaults, items, clear fields, metadata and
+        preferences are in memory, and the encrypted payload is dropped.
+        Secrets stay encrypted: see :meth:`decrypt`. Slow by design (one
+        full PBKDF2 derivation).
+        """
+        self._require_open()
+        if self._credentials.has_file_key:
+            raise RuntimeError("The profile is already unlocked.")
 
-        The write itself is atomic: the encrypted bundle is first
-        written to a sibling temporary file, then moved into place
-        with :func:`os.replace` (an atomic rename on POSIX and
-        Windows). This means a crash, a full disk, or the application
-        being killed mid-write can never leave ``path`` truncated or
-        otherwise corrupted, either the old file is still there
-        untouched, or the new one is there complete.
+        assert self._wrapped_file_key is not None  # set by read() or create()
+        try:
+            file_key = DataKey.unwrap(self._wrapped_file_key, password, purpose="file")
+        except WrongPasswordError as exc:
+            raise PrimaryPasswordError("Wrong primary password.") from exc
 
-        This method does not call :meth:`close`: the manager's
-        in-memory credentials remain usable after saving, since the
-        caller may go on to make further changes and save again.
+        try:
+            try:
+                clear = pyaescbc.decrypt_with_key(
+                    self._encrypted_payload, file_key.key,
+                    authdata=_payload_authdata(self._label),
+                )
+            except pyaescbc.AuthError as exc:
+                raise TamperedDataError("The file content has been tampered with.") from exc
+            try:
+                payload = json.loads(clear.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CorruptedFileError("Invalid file content.") from exc
+            finally:
+                pyaescbc.delete_bytearray(clear)
+            try:
+                self._load_payload(payload)
+            except (TypeError, ValueError, UUIDError, CorruptedBase64Error) as exc:
+                raise CorruptedFileError(f"Invalid file content: {exc}") from exc
+        except BaseException:
+            file_key.clear()
+            raise
+
+        self._credentials.set_file_key(file_key)
+        self._encrypted_payload = None
+
+    def decrypt(self, password: bytearray) -> None:
+        """
+        Unwrap the data key with the secondary password.
+
+        Parameters
+        ----------
+        password : bytearray
+            Secondary password. Erased once used, even if wrong.
+
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked, already decrypted, or closed.
+
+        SecondaryPasswordError
+            If ``password`` is wrong.
+
+
+        Notes
+        -----
+        Nothing is decrypted by this call: secrets stay encrypted in
+        the items. Afterwards, the data key is available as
+        :attr:`data_key`, so that each secret can be decrypted on demand
+        (e.g. ``item.get("passwords", data_key=manager.data_key)``).
+        Slow by design (one full PBKDF2 derivation).
+        """
+        self._require_unlocked()
+        if self._credentials.has_data_key:
+            raise RuntimeError("The profile is already decrypted: the data key is available.")
+        assert self._wrapped_data_key is not None  # set by unlock() or create()
+        try:
+            data_key = DataKey.unwrap(self._wrapped_data_key, password, purpose="data")
+        except WrongPasswordError as exc:
+            raise SecondaryPasswordError("Wrong secondary password.") from exc
+        self._credentials.set_data_key(data_key)
+
+    @property
+    def is_unlocked(self) -> bool:
+        """Whether the profile is unlocked: its content (vaults, items, clear fields) is in memory."""
+        return not self._closed and self._credentials.has_file_key
+
+    @property
+    def is_decrypted(self) -> bool:
+        """Whether the profile is decrypted: the data key is available to decrypt secrets on demand."""
+        return not self._closed and self._credentials.has_data_key
+
+    @property
+    def data_key(self) -> DataKey:
+        """
+        Return the data key, to pass to the encrypted-field operations of :class:`Item`.
+
+        Returns
+        -------
+        DataKey
+            The current data key, by reference.
+
+        Raises
+        ------
+        RuntimeError
+            If the data key is not available (see :meth:`decrypt`).
+
+        Notes
+        -----
+        Obtain it right before each use, never keep it: see the
+        class-level Notes.
+        """
+        return self._require_decrypted()
+
+    def _require_open(self) -> None:
+        """Raise :class:`RuntimeError` if the manager has been closed."""
+        if self._closed:
+            raise RuntimeError("The password manager has been closed.")
+
+    def _require_wrapped_file_key(self) -> bytearray:
+        """Return the wrapped file key, or raise :class:`RuntimeError` once closed."""
+        self._require_open()
+        if self._wrapped_file_key is None:
+            raise RuntimeError("The password manager has no file key.")
+        return self._wrapped_file_key
+
+    def _require_unlocked(self) -> list[Vault]:
+        """
+        Return the vaults, raising :class:`RuntimeError` if the profile is locked.
+        """
+        self._require_open()
+        if self._vaults is None or not self._credentials.has_file_key:
+            raise RuntimeError("The profile is locked: call unlock() first.")
+        return self._vaults
+
+    def _require_decrypted(self) -> DataKey:
+        """
+        Return the data key, raising :class:`RuntimeError` if it is not available.
+        """
+        self._require_unlocked()
+        if not self._credentials.has_data_key:
+            raise RuntimeError("The data key is not available: call decrypt() first.")
+        return self._credentials.data_key
+
+    def _touch(self) -> None:
+        """Record a change to the manager itself (see the class-level Notes)."""
+        self._modification_date = _now()
+
+    # ----------------
+    # (De)serialization of the content
+    # ----------------
+
+    def _load_payload(self, payload: Any) -> None:
+        """
+        Load a decrypted payload (see the class-level Notes for its structure).
+
+        Notes
+        -----
+        Same reading rules as :meth:`Item.from_dict`: unknown keys are
+        refused, missing keys take their default value. Every vault UUID
+        must be unique, and so must every item UUID across all vaults.
+        Nothing is kept unless the whole payload is valid.
+        """
+        payload = _check_keys("file content", payload, _PAYLOAD_KEYS)
+        if "secondary_key" not in payload:
+            raise ValueError("file content must contain a 'secondary_key'.")
+        wrapped_data_key = _b64decode("secondary_key", payload["secondary_key"])
+
+        metadata = _check_keys("file metadata", payload.get("metadata", {}), _METADATA_KEYS)
+        if "uuid" not in metadata:
+            raise ValueError("file metadata must contain a 'uuid'.")
+        uuid = _check_uuid(metadata["uuid"])
+        username = _check_optional_name("username", metadata.get("username"))
+        now = _now()
+        creation_date = _check_date("creation_date", metadata.get("creation_date"), now)
+        modification_date = _check_date("modification_date", metadata.get("modification_date"), now)
+
+        vaults = payload.get("vaults") or []
+        if not isinstance(vaults, list):
+            raise TypeError("vaults must be a list.")
+        parsed = [Vault.from_dict(entry) for entry in vaults]
+        _check_unique_uuids(vault.uuid for vault in parsed)
+        _check_unique_uuids(item for vault in parsed for item in vault.item_uuids())
+
+        preferences = _check_keys("preferences", payload.get("preferences", {}), _PREFERENCES_KEYS)
+        self._preferences = {
+            "theme": _check_optional_str(
+                "theme", preferences.get("theme", _DEFAULT_PREFERENCES["theme"])),
+            "language": _check_optional_str(
+                "language", preferences.get("language", _DEFAULT_PREFERENCES["language"])),
+            "lock_timer_s": _check_lock_timer(
+                preferences.get("lock_timer_s", _DEFAULT_PREFERENCES["lock_timer_s"])),
+        }
+        self._uuid, self._username = uuid, username
+        self._creation_date, self._modification_date = creation_date, modification_date
+        self._vaults = parsed
+        self._wrapped_data_key = wrapped_data_key
+
+    def _payload(self) -> PayloadData:
+        """Serialize the content of the file (nothing is decrypted)."""
+        vaults = self._require_unlocked()
+        # All set once unlocked (by unlock() or create()).
+        assert self._uuid is not None and self._wrapped_data_key is not None
+        assert self._creation_date is not None and self._modification_date is not None
+        return {
+            "metadata": {
+                "uuid": self._uuid,
+                "username": self._username,
+                "creation_date": self._creation_date,
+                "modification_date": self._modification_date,
+            },
+            "secondary_key": _b64encode(self._wrapped_data_key),
+            "vaults": [vault.to_dict() for vault in vaults],
+            "preferences": cast(PreferencesData, dict(self._preferences)),
+        }
+
+    # ----------------
+    # Saving and closing
+    # ----------------
+
+    def to_bytes(self) -> bytearray:
+        """
+        Serialize the whole manager into the (encrypted) content of a file.
+
+        Returns
+        -------
+        bytearray
+            The complete file content (envelope included), ready to be
+            written with :meth:`write_file`.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        Notes
+        -----
+        Fast: only the file key is used (no key derivation), and the
+        data key is not needed. Counterpart of :meth:`from_bytes`. A new random IV
+        is drawn on every call.
+
+        This is the half of :meth:`save` that reads the manager: call
+        it from the thread that owns the manager (see the class-level
+        Notes on threads).
+
+        The intermediate JSON text of the payload is an immutable
+        ``str`` that cannot be erased; it holds no sensitive value in
+        clear (those stay encrypted with the data key).
+        """
+        clear = bytearray(json.dumps(self._payload(), ensure_ascii=False).encode("utf-8"))
+        encrypted = pyaescbc.encrypt_with_key(
+            clear, self._credentials.file_key.key,
+            authdata=_payload_authdata(self._label),
+            delete_data=True,
+        )
+        envelope = {
+            "format": FORMAT_NAME,
+            "version": FORMAT_VERSION,
+            "label": self._label,
+            "primary_key": _b64encode(self._require_wrapped_file_key()),
+            "payload": _b64encode(encrypted),
+        }
+        return bytearray(json.dumps(envelope, indent=4).encode("utf-8"))
+
+    @staticmethod
+    def write_file(path: str | Path, data: bytes | bytearray) -> None:
+        """
+        Atomically write the content of a file.
+
+        Parameters
+        ----------
+        path : str or Path
+            Destination file. Its parent directory must exist. Created
+            if it does not exist yet, replaced if it does.
+
+        data : bytes or bytearray
+            Content to write, typically returned by :meth:`to_bytes`.
+
+        Raises
+        ------
+        OSError
+            If the file cannot be written. ``path`` is then left
+            untouched.
+
+        Notes
+        -----
+        The content is written to a sibling temporary file, flushed to
+        disk, then moved into place with :func:`os.replace` (atomic on
+        POSIX and Windows): a crash or a full disk can never leave
+        ``path`` truncated. Either the old file is still there, or the
+        new one is there complete.
+
+        Uses nothing but its arguments: safe to call from a worker
+        thread while the manager keeps being used (see the class-level
+        Notes on threads).
         """
         path = Path(path)
-        encrypted = self.encrypt()
-
         tmp_path = path.with_name(path.name + ".tmp")
         try:
-            tmp_path.write_bytes(bytes(encrypted))
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, path)
         except OSError:
             tmp_path.unlink(missing_ok=True)
             raise
 
-    def close(self) -> None:
+    def save(self, path: str | Path) -> None:
         """
-        Erase the manager's primary and secondary passwords from memory.
-
-        Notes
-        -----
-        Irreversible: after calling this method, any subsequent
-        operation that needs to decrypt or encrypt data (including
-        :meth:`encrypt` and therefore :meth:`save_changes`) will fail.
-        Make sure any pending change has already been saved before
-        closing the manager.
-        """
-        with self._lock:
-            self._credentials.clear()
-
-    def get_credentials(self) -> Credentials:
-        """
-        Return the manager's :class:`Credentials` instance.
-
-        Returns
-        -------
-        Credentials
-            Holds both the primary and secondary password/iteration
-            pairs.
-
-        Notes
-        -----
-        This is the object to pass to :meth:`Item.get`/:meth:`Item.set`
-        (and :meth:`Item.get_custom`/:meth:`Item.set_custom`) when
-        reading or writing an item's encrypted fields from outside
-        this class, for instance from :class:`ItemViewer`. It is the
-        very same instance this manager itself encrypts and decrypts
-        with, so its password is never copied or wiped on a per-call
-        basis (see :class:`Item`'s class-level docstring); only
-        :meth:`close` (via :meth:`Credentials.clear`) erases it.
-        """
-        with self._lock:
-            return self._credentials
-
-    def change_credentials(self, new_credentials: Credentials) -> None:
-        """
-        Replace the manager's credentials, re-encrypting every vault.
+        Encrypt the manager and write it to a file.
 
         Parameters
         ----------
-        new_credentials : Credentials
-            Replacement credentials. Its secondary password and
-            iteration count are used to re-encrypt every vault's
-            items; its primary password/iteration pair simply becomes
-            this manager's new primary credentials (see Notes).
+        path : str or Path
+            Destination file.
 
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+            If the profile is locked (see :meth:`unlock`).
+
+        OSError
+            If the file cannot be written.
+
+        Notes
+        -----
+        Shorthand for ``write_file(path, to_bytes())``, entirely in the
+        calling thread. See the class-level Notes to write from a
+        worker thread instead.
+        """
+        self.write_file(path, self.to_bytes())
+
+    def encrypt(self) -> None:
+        """
+        Forget the data key: secrets can no longer be decrypted.
+
+        Raises
+        ------
+        RuntimeError
+            If the manager is closed.
+
+        Notes
+        -----
+        Counterpart of :meth:`decrypt`. Nothing needs re-encrypting:
+        secrets are never held in clear, only decrypted on demand, so
+        erasing the data key is enough to make them unreadable again
+        until :meth:`decrypt` is called. Everything else (vaults,
+        items, clear fields) stays available. Harmless if the data key
+        is already forgotten.
+        """
+        self._require_open()
+        self._credentials.clear_data_key()
+
+    def close(self) -> None:
+        """
+        Erase both keys from memory and drop the content.
+
+        Notes
+        -----
+        Irreversible: every later operation raises
+        :class:`RuntimeError`. Unsaved changes are lost: save first.
+        Calling it more than once is harmless.
+        """
+        self._credentials.clear()
+        self._vaults = None
+        self._encrypted_payload = None
+        self._closed = True
+
+    # ----------------
+    # Passwords
+    # ----------------
+
+    def change_primary_password(
+        self,
+        current_password: bytearray,
+        new_password: bytearray,
+    ) -> None:
+        """
+        Change the primary password.
+
+        Parameters
+        ----------
+        current_password : bytearray
+            Current primary password, required so that an unlocked but
+            unattended session cannot be used to change it. Erased once
+            used.
+
+        new_password : bytearray
+            New primary password. Erased once used.
+
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        PrimaryPasswordError
+            If ``current_password`` is wrong. Nothing is changed.
+
+        ValueError
+            If ``new_password`` is empty. Nothing is changed.
+
+
+        Notes
+        -----
+        A new random file key is generated and wrapped with
+        ``new_password``: anyone who knows the old password and kept an
+        old copy of the file can therefore not use it to read files
+        saved from now on. Nothing else is re-encrypted.
+
+        Takes effect on disk at the next :meth:`save`: save right
+        after. Updates :attr:`modification_date`. Slow by design (two
+        full PBKDF2 derivations).
+        """
+        self._require_unlocked()
+        self._check_current_password(current_password, new_password, "file")
+
+        new_key = DataKey.random()
+        try:
+            wrapped = new_key.wrap(new_password, Credentials.PRIMARY_ITERATIONS, purpose="file")
+        except BaseException:
+            new_key.clear()
+            raise
+
+        self._wrapped_file_key = wrapped
+        self._credentials.set_file_key(new_key)
+        self._touch()
+
+    def change_secondary_password(
+        self,
+        current_password: bytearray,
+        new_password: bytearray,
+    ) -> None:
+        """
+        Change the secondary password.
+
+        Parameters
+        ----------
+        current_password : bytearray
+            Current secondary password, required so that an unlocked
+            but unattended session cannot be used to change it. Erased
+            once used.
+
+        new_password : bytearray
+            New secondary password. Erased once used.
+
+
+        Raises
+        ------
+        RuntimeError
+            If the data key is not available (see :meth:`decrypt`).
 
         SecondaryPasswordError
-            If decryption fails for any item because of an
-            authentication error against the manager's *current*
-            secondary credentials. This should not normally happen,
-            since those are, by construction, the credentials every
-            item was last encrypted with, but see
-            :meth:`Vault.change_credentials` and
-            :meth:`Item.change_credentials` for exactly what is
-            checked.
+            If ``current_password`` is wrong. Nothing is changed.
+
+        ValueError
+            If ``new_password`` is empty. Nothing is changed.
+
+        TamperedDataError
+            If a sensitive value fails to decrypt. Nothing is changed.
+
 
         Notes
         -----
-        Atomic: every vault is re-encrypted on a throwaway deep copy
-        first (:meth:`Vault.change_credentials` is itself atomic per
-        vault, which in turn relies on :meth:`Item.change_credentials`
-        being atomic per item). Only once *every* vault's copy has
-        succeeded does this method replace :attr:`_vaults` and
-        :attr:`_credentials` together, in one go. If any vault fails
-        partway through, the exception is raised before that
-        replacement, so both :attr:`_vaults` and :attr:`_credentials`
-        are left exactly as they were, no vault ends up re-encrypted
-        while others are not, and the manager never ends up holding a
-        mix of old and new credentials.
+        A new random data key is generated and wrapped with
+        ``new_password``, and every sensitive value of every item is
+        re-encrypted with it (fast: no key derivation is involved).
+        Anyone who knows the old password and kept an old copy of the
+        file can therefore not use it to read values saved from now on.
 
-        ``new_credentials`` entirely replaces :attr:`_credentials`,
-        including its primary password/iteration pair: this method
-        doubles as how to change the *primary* password too, simply
-        by giving ``new_credentials`` different primary keys (with
-        the same, or also different, secondary keys). Nothing needs
-        to happen for the primary password beyond that swap: it only
-        ever encrypts the outer bundle as a whole, in :meth:`encrypt`,
-        the next time :meth:`save_changes` runs, it plays no part in
-        how individual vaults or items are encrypted.
+        Atomic: every item is prepared first, and everything is
+        committed at once only once all succeeded; the :class:`Item`
+        and :class:`Vault` instances are kept. The previous data key is
+        erased: references to it held elsewhere become unusable (see
+        the class-level Notes on the data key).
 
-        As with :meth:`Vault.change_credentials`, the trade-off is
-        memory: for the duration of this call, the manager holds two
-        full sets of vaults (and, transitively, items) at once.
-
-        To change only one of the two (e.g. the primary password
-        while leaving the secondary one untouched), build
-        ``new_credentials`` with
-        :meth:`Credentials.set_primary_password`/
-        :meth:`Credentials.set_secondary_password` for the side being
-        changed, and, for the side that should stay the same, the
-        very same method again, simply fed with this manager's
-        current password for that side (:meth:`get_credentials`, then
-        :meth:`Credentials.get_primary_password` or
-        :meth:`Credentials.get_secondary_password`). There is no PIN
-        to carry over and no iteration count to derive or preserve
-        anymore: it is always the fixed
-        :attr:`Credentials.PRIMARY_ITERATIONS`/
-        :attr:`Credentials.SECONDARY_ITERATIONS`.
+        Takes effect on disk at the next :meth:`save`: save right
+        after. Updates :attr:`modification_date`, but no vault's or
+        item's. Slow by design (two full PBKDF2 derivations).
         """
-        with self._lock:
-            self._require_decrypted()
+        old_key = self._require_decrypted()
+        self._check_current_password(current_password, new_password, "data")
 
-            draft_vaults: dict[str, Vault] = {
-                name: copy.deepcopy(vault) for name, vault in self._vaults.items()
-            }
-            for vault in draft_vaults.values():
-                vault.change_credentials(self._credentials, new_credentials)
+        new_key = DataKey.random()
+        try:
+            commits = [vault._prepare_change_data_key(old_key, new_key)
+                       for vault in self._require_unlocked()]
+            wrapped = new_key.wrap(new_password, Credentials.SECONDARY_ITERATIONS, purpose="data")
+        except BaseException:
+            new_key.clear()
+            raise
 
-            self._vaults = draft_vaults
-            self._credentials = new_credentials
+        for commit in commits:
+            commit()
+        self._wrapped_data_key = wrapped
+        self._credentials.set_data_key(new_key)
+        self._touch()
 
-    # ----------------
-    # Serialization
-    # ----------------
-
-    def to_dict(self) -> PasswordManagerData:
-        """Serialize the complete password manager to a dictionary.
-
-        Returns
-        -------
-        PasswordManagerData
-            Complete serialized password manager data.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+    def _check_current_password(
+        self,
+        current_password: bytearray,
+        new_password: bytearray,
+        purpose: Literal["file", "data"],
+    ) -> None:
+        """
+        Verify a current password before changing it.
 
         Notes
         -----
-        The ``auth`` field is regenerated from the current secondary
-        credentials. Item UUIDs are not serialized separately: they
-        are already present inside each vault's items.
+        If verification fails, ``new_password`` is erased too, so that
+        no password is ever left behind by a failed change.
         """
-        with self._lock:
-            self._require_decrypted()
-            return {
-                "metadata": self._metadata,
-                "auth": self._create_auth(),
-                "vaults": {
-                    vault.name: vault.to_dict()
-                    for vault in self._vaults.values()
-                },
-            }
-
-    def to_json(self) -> str:
-        """Serialize the password manager to JSON.
-
-        Returns
-        -------
-        str
-            JSON representation of the complete password manager.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`to_dict`).
-        """
-        return json.dumps(self.to_dict(), ensure_ascii=False, indent=4)
+        wrapped = self._wrapped_file_key if purpose == "file" else self._wrapped_data_key
+        assert wrapped is not None  # the manager is unlocked here
+        error = PrimaryPasswordError if purpose == "file" else SecondaryPasswordError
+        try:
+            DataKey.unwrap(wrapped, current_password, purpose=purpose).clear()
+        except BaseException as exc:
+            if isinstance(new_password, bytearray):
+                pyaescbc.delete_bytearray(new_password)
+            if isinstance(exc, WrongPasswordError):
+                raise error(f"Wrong current {'primary' if purpose == 'file' else 'secondary'} password.") from exc
+            raise
 
     # ----------------
-    # UUID management
+    # Label (readable without password)
     # ----------------
 
     @property
-    def uuids(self) -> tuple[str, ...]:
-        """Return all item UUIDs currently registered across all vaults.
+    def label(self) -> ClearString | None:
+        """
+        Return the label of the profile.
 
         Returns
         -------
-        tuple of str
-            UUIDs of every item contained in any vault managed by
-            this object.
+        ClearString or None
+            Display name, or ``None`` for an anonymous profile.
+            Available as soon as the file has been read: no password is
+            needed.
 
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+            If the manager is closed.
+        """
+        self._require_open()
+        return self._label
+
+    def set_label(self, value: ClearString | None) -> None:
+        """
+        Set the label of the profile.
+
+        Parameters
+        ----------
+        value : ClearString or None
+            New display name, stripped. ``None``, or a blank label, makes
+            the profile anonymous.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked: the label is authenticated
+            with the payload, which must be re-encrypted.
+
+        TypeError
+            If ``value`` is neither a ``str`` nor ``None``.
 
         Notes
         -----
-        Computed from the vaults' items rather than stored
-        separately, so it can never drift out of sync with the
-        actual items even if a :class:`Vault` is modified directly.
+        Takes effect on disk at the next :meth:`save`. Updates
+        :attr:`modification_date`.
         """
-        with self._lock:
-            self._require_decrypted()
-            return tuple(
-                item.uuid
-                for vault in self._vaults.values()
-                for item in vault.get_items()
-            )
-
-    def create_uuid(self) -> str:
-        """Generate a globally unique item UUID.
-
-        Returns
-        -------
-        str
-            Newly generated UUID that does not conflict with any
-            UUID currently registered by the manager.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :attr:`uuids`).
-
-        Notes
-        -----
-        The generated UUID is not added to the manager automatically.
-        It is only reserved when the corresponding item is added.
-        """
-        with self._lock:
-            existing = self.uuids
-            while True:
-                item_uuid = str(uuid.uuid4())
-                if item_uuid not in existing:
-                    return item_uuid
-
-    # ----------------
-    # Vault management
-    # ----------------
-
-    def get_vault(self, name: str) -> Vault:
-        """Return a vault by name.
-
-        Parameters
-        ----------
-        name : str
-            Name of the vault to retrieve.
-
-        Returns
-        -------
-        Vault
-            Vault associated with ``name``.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
-
-        VaultNotFoundError
-            If no vault with the specified name exists.
-        """
-        with self._lock:
-            self._require_decrypted()
-            try:
-                return self._vaults[name]
-            except KeyError as exc:
-                raise VaultNotFoundError(f"Unknown vault: {name!r}") from exc
-
-    def get_vaults(self) -> list[Vault]:
-        """Return all vaults.
-
-        Returns
-        -------
-        list of Vault
-            List containing all vaults currently managed.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
-        """
-        with self._lock:
-            self._require_decrypted()
-            return list(self._vaults.values())
-
-    def add_vault(self, vault: Vault) -> None:
-        """Add an existing vault to the manager.
-
-        Parameters
-        ----------
-        vault : Vault
-            Vault to add.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
-
-        VaultAlreadyExistsError
-            If another vault with the same name already exists.
-
-        Notes
-        -----
-        The vault is stored by reference and is not copied. UUID
-        collisions between the supplied vault's items and UUIDs
-        already registered by the manager are not validated here.
-        """
-        with self._lock:
-            self._require_decrypted()
-            if vault.name in self._vaults:
-                raise VaultAlreadyExistsError(f"Vault already exists: {vault.name!r}")
-            self._vaults[vault.name] = vault
-
-    def add_empty_vault(self, name: str) -> Vault:
-        """Create and add an empty vault.
-
-        Parameters
-        ----------
-        name : str
-            Name of the new vault.
-
-        Returns
-        -------
-        Vault
-            Newly created empty vault.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`add_vault`).
-
-        VaultAlreadyExistsError
-            If a vault with the specified name already exists.
-        """
-        with self._lock:
-            vault = Vault.create_empty(name)
-            self.add_vault(vault)
-            return vault
-
-    def remove_vault(self, name: str, force: bool = False) -> None:
-        """Remove a vault.
-
-        Parameters
-        ----------
-        name : str
-            Name of the vault to remove.
-
-        force : bool, optional
-            If ``False`` (the default), removal is refused when the
-            vault still contains at least one item, so a vault full
-            of items can never be discarded by accident. Pass
-            ``True`` to remove the vault regardless of its contents.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
-
-        VaultNotFoundError
-            If the specified vault does not exist.
-
-        ValueError
-            If the vault is not empty and ``force`` is ``False``.
-
-        Notes
-        -----
-        The items themselves are not individually removed first:
-        the whole (possibly non-empty) vault is simply dropped from
-        :attr:`_vaults` in one go once this method has decided to
-        proceed.
-        """
-        with self._lock:
-            self._require_decrypted()
-            if name not in self._vaults:
-                raise VaultNotFoundError(f"Unknown vault: {name!r}")
-            if not force and self._vaults[name].get_items():
-                raise ValueError(
-                    f"Vault {name!r} is not empty; pass force=True to remove it anyway."
-                )
-            del self._vaults[name]
-
-    def rename_vault(self, old_name: str, new_name: str) -> None:
-        """Rename an existing vault.
-
-        Parameters
-        ----------
-        old_name : str
-            Current vault name.
-
-        new_name : str
-            New vault name.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
-
-        VaultNotFoundError
-            If ``old_name`` does not identify an existing vault.
-
-        VaultAlreadyExistsError
-            If ``new_name`` is already used by another vault.
-        """
-        with self._lock:
-            self._require_decrypted()
-            if old_name not in self._vaults:
-                raise VaultNotFoundError(f"Unknown vault: {old_name!r}")
-            if new_name in self._vaults:
-                raise VaultAlreadyExistsError(f"Vault already exists: {new_name!r}")
-
-            vault = self._vaults.pop(old_name)
-            vault.rename(new_name)
-            self._vaults[new_name] = vault
-
-    # ----------------
-    # Item management
-    # ----------------
-
-    def get_item(self, item_uuid: str, vault: str = None) -> Item:
-        """Return an item by UUID within a given vault.
-
-        Parameters
-        ----------
-        item_uuid : str
-            UUID of the item to retrieve.
-
-        vault : str
-            Name of the vault containing the item.
-
-        Returns
-        -------
-        Item
-            Item associated with ``item_uuid``.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`get_vault`/:attr:`uuids`).
-
-        VaultNotFoundError
-            If the specified vault does not exist.
-
-        ItemNotFoundError
-            If the specified item does not exist in that vault.
-        """
-        with self._lock:
-            if vault is not None:
-                return self.get_vault(vault).get_item(item_uuid)
-            else:
-                if not item_uuid in self.uuids:
-                    raise ValueError("item uuid invalid")
-
-                for vault in self.get_vaults():
-                    if item_uuid in vault._items.keys():
-                        return vault.get_item(item_uuid)
-
-    def add_empty_item(self, vault: str, item_uuid: str | None = None) -> Item:
-        """Create and add an empty item to a vault.
-
-        Parameters
-        ----------
-        vault : str
-            Name of the vault receiving the new item.
-
-        item_uuid : str or None, optional
-            UUID to assign to the item. If ``None``, a new globally
-            unique UUID is generated.
-
-        Returns
-        -------
-        Item
-            Newly created empty item.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`get_vault`/:attr:`uuids`).
-
-        VaultNotFoundError
-            If the target vault does not exist.
-
-        ItemAlreadyExistsError
-            If the supplied UUID is already used by another item.
-        """
-        with self._lock:
-            target_vault = self.get_vault(vault)
-
-            if item_uuid is None:
-                item_uuid = self.create_uuid()
-            elif item_uuid in self.uuids:
-                raise ItemAlreadyExistsError(f"Item UUID already exists: {item_uuid}")
-
-            return target_vault.add_empty_item(item_uuid)
-
-    def add_item(self, item: Item, vault: str) -> Item:
-        """
-        Add an existing, possibly non-empty item to a vault.
-
-        Unlike :meth:`add_empty_item`, which always creates a fresh
-        empty item in place, this adds an already-populated
-        :class:`Item` -- typically built elsewhere, or produced by
-        :meth:`Item.deepcopy` -- to ``vault``.
-
-        Parameters
-        ----------
-        item : Item
-            Item to add.
-
-        vault : str
-            Name of the vault receiving the item.
-
-        Returns
-        -------
-        Item
-            The item actually added to ``vault``. This is ``item``
-            itself, unless its UUID collided with one already
-            registered anywhere in the manager, in which case a new
-            :class:`Item` -- carrying the same data but a freshly
-            generated UUID -- is added and returned instead (see
-            Notes).
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`get_vault`/:attr:`uuids`).
-
-        VaultNotFoundError
-            If the target vault does not exist.
-
-        Notes
-        -----
-        Item UUIDs must stay globally unique across the whole
-        manager (see :attr:`uuids`), so ``item``'s current UUID is
-        *never* kept if it already conflicts with an existing item,
-        in *any* vault, not just ``vault``: a brand-new UUID is
-        generated instead (:meth:`create_uuid`), and ``item`` is
-        re-wrapped around that new UUID -- its data (as returned by
-        :meth:`Item.to_dict`) is carried over unchanged, by
-        reference, only the UUID differs -- before being added.
-
-        The item is otherwise stored by reference: its data is not
-        copied. Pass :meth:`Item.deepcopy` explicitly for an
-        independent copy (see :meth:`duplicate_item`, which does
-        exactly that to duplicate an item already in the manager).
-        """
-        with self._lock:
-            target_vault = self.get_vault(vault)
-
-            item_uuid = item.uuid
-            if item_uuid in self.uuids:
-                item_uuid = self.create_uuid()
-                item = Item(item_uuid, item.to_dict())
-
-            target_vault._items[item_uuid] = item
-            return item
-
-    def duplicate_item(self, item_uuid: str, vault: str) -> Item:
-        """
-        Duplicate an existing item within a vault.
-
-        Parameters
-        ----------
-        item_uuid : str
-            UUID of the item to duplicate.
-
-        vault : str
-            Name of the vault containing the item; the duplicate is
-            added to this same vault.
-
-        Returns
-        -------
-        Item
-            The newly added duplicate. Its UUID is always different
-            from ``item_uuid`` (see Notes).
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`get_vault`).
-
-        VaultNotFoundError
-            If the specified vault does not exist.
-
-        ItemNotFoundError
-            If the specified item does not exist in that vault.
-
-        Notes
-        -----
-        Implemented as :meth:`Item.deepcopy` followed by
-        :meth:`add_item`. :meth:`Item.deepcopy` keeps the original
-        UUID on the copy, but that UUID necessarily collides with
-        the original item (still present in the manager), so
-        :meth:`add_item` always generates a fresh one for it: the
-        duplicate never ends up sharing a UUID with the item it was
-        copied from.
-
-        The duplicate's data is an independent deep copy: mutating
-        it afterwards never affects the original item, and vice
-        versa.
-        """
-        with self._lock:
-            original = self.get_vault(vault).get_item(item_uuid)
-            duplicate = original.deepcopy()
-            return self.add_item(duplicate, vault)
-
-    def remove_item(self, item_uuid: str, vault: str) -> None:
-        """Remove an item.
-
-        Parameters
-        ----------
-        item_uuid : str
-            UUID of the item to remove.
-
-        vault : str
-            Name of the vault containing the item.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`get_vault`).
-
-        VaultNotFoundError
-            If the specified vault does not exist.
-
-        ItemNotFoundError
-            If the specified item does not exist.
-        """
-        with self._lock:
-            self.get_vault(vault).remove_item(item_uuid)
-
-    def delete_item(self, vault: str, item_uuid: str) -> None:
-        """Delete an item from a vault.
-
-        Parameters
-        ----------
-        vault : str
-            Name of the vault containing the item.
-
-        item_uuid : str
-            UUID of the item to delete.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`remove_item`).
-
-        VaultNotFoundError
-            If the specified vault does not exist.
-
-        ItemNotFoundError
-            If the specified item does not exist in that vault.
-
-        Notes
-        -----
-        This is the same operation as :meth:`remove_item`, exposed
-        under the name and argument order (``vault`` first, then
-        ``item_uuid``) expected by the GUI layer, which naturally
-        knows which vault it is acting on before it knows which item.
-        """
-        with self._lock:
-            self.remove_item(item_uuid, vault)
-
-    def move_item(self, item_uuid: str, source_vault: str, target_vault: str) -> None:
-        """Move an item from one vault to another.
-
-        Parameters
-        ----------
-        item_uuid : str
-            UUID of the item to move.
-
-        source_vault : str
-            Name of the vault the item currently belongs to.
-
-        target_vault : str
-            Name of the vault the item should be moved into.
-
-        Raises
-        ------
-        ValueError
-            If ``source_vault`` and ``target_vault`` are the same.
-
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`get_vault`).
-
-        VaultNotFoundError
-            If ``source_vault`` or ``target_vault`` does not exist.
-
-        ItemNotFoundError
-            If the item does not exist in ``source_vault``.
-
-        ItemAlreadyExistsError
-            If an item with the same UUID unexpectedly already exists
-            in ``target_vault``. This should not normally happen,
-            since item UUIDs are meant to be unique across the whole
-            manager (see :attr:`uuids`), but is still checked before
-            any data is moved, so a corrupted vault can never silently
-            overwrite an existing item.
-
-        Notes
-        -----
-        The item is relocated by reference: it is not re-encrypted,
-        re-serialized, or copied, only removed from one vault's item
-        store and inserted into the other's. Because :class:`Vault`
-        does not expose a public method for inserting an already
-        constructed :class:`Item`, this reaches into the target
-        vault's internal ``_items`` mapping directly, the same
-        private attribute :meth:`get_item` already relies on above.
-        """
-        if source_vault == target_vault:
-            raise ValueError("source_vault and target_vault must differ.")
-
-        with self._lock:
-            source = self.get_vault(source_vault)
-            target = self.get_vault(target_vault)
-
-            item = source.get_item(item_uuid)
-
-            if item_uuid in target._items:
-                raise ItemAlreadyExistsError(
-                    f"Item UUID already exists in {target_vault!r}: {item_uuid}"
-                )
-
-            source.remove_item(item_uuid)
-            target._items[item_uuid] = item
-
-    # ----------------
-    # Export / Import
-    # ----------------
-
-    def _export_items(
-        self,
-        path: str | Path,
-        items: list[str | tuple[str, str]],
-        export_credentials: Credentials,
-    ) -> None:
-        """
-        Export a selection of items to a brand-new, standalone vault file.
-
-        Builds a throwaway :class:`PasswordManager` holding a single
-        vault named ``"exported items"``, populates it with a
-        re-encrypted copy of every item in ``items``, and writes the
-        result to ``path`` -- an ordinary encrypted vault file,
-        readable back with a plain :class:`PasswordManager` (primary
-        password: ``export_credentials``) or with :meth:`_import_items`.
-
-        Parameters
-        ----------
-        path : str or Path
-            Destination file for the exported bundle. Created if it
-            does not exist, overwritten if it does.
-
-        items : list of (str or tuple of (str, str))
-            Items to export. Each entry is either:
-
-            - a bare item UUID (``str``), resolved by searching every
-              vault of this manager (see :meth:`get_item`), or
-            - a ``(item_uuid, vault)`` tuple, resolved directly in
-              that vault -- cheaper, and required if the same UUID
-              could otherwise be ambiguous.
-
-        export_credentials : Credentials
-            Primary and secondary password/iteration pairs the
-            exported file is encrypted with. Whoever receives the
-            file needs these same credentials to open it.
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet (reached
-            transitively through :meth:`get_item`).
-
-        VaultNotFoundError
-            If an ``(item_uuid, vault)`` entry names a vault that
-            does not exist.
-
-        ItemNotFoundError
-            If an item UUID cannot be found.
-
-        OSError
-            If the encrypted bundle cannot be written to ``path``
-            (reached transitively through :meth:`save_changes`).
-
-        Notes
-        -----
-        For each requested item: :meth:`Item.deepcopy` first, so the
-        original item in *this* manager is never touched, then
-        :meth:`Item.change_credentials` on that copy, from this
-        manager's own secondary credentials to
-        ``export_credentials``' secondary credentials, so the
-        exported copy is decryptable with ``export_credentials``
-        alone. The re-encrypted copy is then handed to
-        :meth:`add_item`, which is also what assigns it its final
-        UUID (kept as-is unless it happens to collide, see
-        :meth:`add_item`).
-
-        The temporary manager is built with :meth:`PasswordManager.new`
-        (no on-disk file, nothing to decrypt) and is otherwise a
-        normal, fully functional manager: :meth:`save_changes` at the
-        end encrypts and writes it exactly as it would for any other
-        manager.
-        """
-        with self._lock:
-            self._require_decrypted()
-
-            temp_manager = PasswordManager.new({}, export_credentials)
-            temp_manager.add_empty_vault("exported items")
-
-            for entry in items:
-                if isinstance(entry, tuple):
-                    item_uuid, item_vault = entry
-                else:
-                    item_uuid, item_vault = entry, None
-
-                original = self.get_item(item_uuid, vault=item_vault)
-                duplicate = original.deepcopy()
-                duplicate.change_credentials(self._credentials, export_credentials)
-                temp_manager.add_item(duplicate, "exported items")
-
-            temp_manager.save_changes(path)
-
-    def _import_items(
-        self,
-        path: str | Path,
-        *,
-        vault: str = "imported items",
-        import_credentials: Credentials,
-    ) -> list[Item]:
-        """
-        Import items previously written by :meth:`_export_items`.
-
-        Opens the standalone vault file at ``path`` with
-        ``import_credentials``, re-encrypts every item found in it
-        with this manager's own secondary credentials, and adds the
-        result to ``vault`` in this manager (created empty first if
-        it does not exist yet).
-
-        Parameters
-        ----------
-        path : str or Path
-            Exported bundle to import, as written by
-            :meth:`_export_items` (or any other :class:`PasswordManager`
-            saved to a file).
-
-        vault : str, optional
-            Name of the vault in *this* manager the imported items
-            are added to. Created empty first if it does not already
-            exist. Defaults to ``"imported items"``.
-
-        import_credentials : Credentials
-            Primary and secondary password/iteration pairs the file
-            at ``path`` was encrypted with (i.e. the exporter's
-            ``export_credentials``).
-
-        Returns
-        -------
-        list of Item
-            The items actually added to ``vault``, in the order they
-            were read from ``path`` (see :meth:`add_item` for why an
-            added item's UUID might differ from its UUID in the
-            exported file).
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`decrypt_data` has not been called yet on
-            *this* manager.
-
-        OSError
-            If ``path`` cannot be read.
-
-        PrimaryPasswordError
-            If ``import_credentials``' primary password does not
-            match the one ``path`` was encrypted with.
-
-        SecondaryPasswordError
-            If ``import_credentials``' secondary password does not
-            match the one ``path`` was encrypted with.
-
-        VaultNotFoundError
-            If ``path`` does not contain an ``"exported items"``
-            vault (for instance, a vault file not produced by
-            :meth:`_export_items`).
-
-        Notes
-        -----
-        The file at ``path`` is opened through a throwaway
-        :class:`PasswordManager` of its own, decrypted with
-        ``import_credentials`` and verified with
-        :meth:`check_secondary`, exactly like opening any vault
-        file. Only its ``"exported items"`` vault is read: that is
-        the fixed name :meth:`_export_items` always writes to.
-
-        Each item is handled the same way as in :meth:`_export_items`,
-        mirrored: :meth:`Item.deepcopy` first (so the temporary
-        manager's own items are left untouched), then
-        :meth:`Item.change_credentials` from ``import_credentials``'
-        secondary credentials to this manager's own, before
-        :meth:`add_item` adds the copy to ``vault``.
-        """
-        with self._lock:
-            self._require_decrypted()
-
-            temp_manager = PasswordManager(
-                bytearray(Path(path).read_bytes()),
-                import_credentials,
-            )
-            temp_manager.decrypt_data()
-            temp_manager.check_secondary()
-
-            exported_vault = temp_manager.get_vault("exported items")
-
-            if vault not in self._vaults:
-                self.add_empty_vault(vault)
-
-            imported: list[Item] = []
-            for original in exported_vault.get_items():
-                duplicate = original.deepcopy()
-                duplicate.change_credentials(import_credentials, self._credentials)
-                imported.append(self.add_item(duplicate, vault))
-
-            return imported
+        self._require_unlocked()
+        self._label = _check_optional_name("label", value)
+        self._touch()
 
     # ----------------
     # Metadata
     # ----------------
 
-    def get_username(self) -> ClearString | None:
-        """Return the username stored in the manager metadata.
-
-        Returns
-        -------
-        ClearString or None
-            Stored username, or ``None`` if no username is configured.
+    @property
+    def uuid(self) -> str:
+        """
+        Return the unique identifier of the profile.
 
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+            If the profile is locked (see :meth:`unlock`).
         """
-        with self._lock:
-            self._require_decrypted()
-            return self._metadata["username"]
+        self._require_unlocked()
+        assert self._uuid is not None
+        return self._uuid
+
+    @property
+    def creation_date(self) -> str:
+        """
+        Return the creation date of the profile (ISO 8601, with timezone).
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+        """
+        self._require_unlocked()
+        assert self._creation_date is not None
+        return self._creation_date
+
+    @property
+    def modification_date(self) -> str:
+        """
+        Return the date of the last change to the manager itself.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        Notes
+        -----
+        See the class-level Notes for which operations update it.
+        """
+        self._require_unlocked()
+        assert self._modification_date is not None
+        return self._modification_date
+
+    def get_username(self) -> ClearString | None:
+        """
+        Return the username.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+        """
+        self._require_unlocked()
+        return self._username
 
     def set_username(self, value: ClearString | None) -> None:
-        """Set the username stored in the manager metadata.
+        """
+        Set the username.
 
         Parameters
         ----------
         value : ClearString or None
-            New username. ``None`` removes the stored username.
+            New username, stripped. ``None``, or a blank username,
+            removes it.
 
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+            If the profile is locked (see :meth:`unlock`).
 
         TypeError
             If ``value`` is neither a ``str`` nor ``None``.
+
+        Notes
+        -----
+        Updates :attr:`modification_date`. The file name does not
+        depend on the username (see :func:`profile_path`), and neither
+        does the :attr:`label`: change it separately if wanted.
         """
-        if value is not None and not isinstance(value, str):
-            raise TypeError(f"value must be a string, not {type(value)}")
-        with self._lock:
-            self._require_decrypted()
-            self._metadata["username"] = value
+        self._require_unlocked()
+        self._username = _check_optional_name("username", value)
+        self._touch()
+
+    # ----------------
+    # Preferences
+    # ----------------
 
     def get_theme(self) -> ClearString | None:
-        """Return the display theme stored in the manager metadata.
-
-        Returns
-        -------
-        ClearString or None
-            ``"light"`` or ``"dark"`` (see :mod:`theme`), or ``None``
-            if unset (should not normally happen, see
-            :attr:`_DEFAULT_METADATA`).
+        """
+        Return the display theme (e.g. ``"dark"``, ``"light"``).
 
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+            If the profile is locked (see :meth:`unlock`).
         """
-        with self._lock:
-            self._require_decrypted()
-            return self._metadata["theme"]
+        self._require_unlocked()
+        return self._preferences["theme"]
 
     def set_theme(self, value: ClearString | None) -> None:
-        """Set the display theme stored in the manager metadata.
+        """
+        Set the display theme.
 
         Parameters
         ----------
         value : ClearString or None
-            New theme (``"light"`` or ``"dark"``). ``None`` clears it.
+            New theme. Not interpreted by this class.
 
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+            If the profile is locked (see :meth:`unlock`).
 
         TypeError
             If ``value`` is neither a ``str`` nor ``None``.
         """
-        if value is not None and not isinstance(value, str):
-            raise TypeError(f"value must be a string, not {type(value)}")
-        with self._lock:
-            self._require_decrypted()
-            self._metadata["theme"] = value
+        self._require_unlocked()
+        self._preferences["theme"] = _check_optional_str("theme", value)
 
     def get_language(self) -> ClearString | None:
-        """Return the display language stored in the manager metadata.
-
-        Returns
-        -------
-        ClearString or None
-            Language code (e.g. ``"en"``, ``"fr"``, ``"es"``, see
-            :mod:`translate`), or ``None`` if unset.
+        """
+        Return the display language code (e.g. ``"en"``, ``"fr"``).
 
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+            If the profile is locked (see :meth:`unlock`).
         """
-        with self._lock:
-            self._require_decrypted()
-            return self._metadata["language"]
+        self._require_unlocked()
+        return self._preferences["language"]
 
     def set_language(self, value: ClearString | None) -> None:
-        """Set the display language stored in the manager metadata.
+        """
+        Set the display language code.
 
         Parameters
         ----------
         value : ClearString or None
-            New language code. ``None`` clears it.
+            New language code. Not interpreted by this class.
 
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+            If the profile is locked (see :meth:`unlock`).
 
         TypeError
-            If ``value`` is neither a ``str`` nor ``None``.vault
+            If ``value`` is neither a ``str`` nor ``None``.
         """
-        if value is not None and not isinstance(value, str):
-            raise TypeError(f"value must be a string, not {type(value)}")
-        with self._lock:
-            self._require_decrypted()
-            self._metadata["language"] = value
+        self._require_unlocked()
+        self._preferences["language"] = _check_optional_str("language", value)
 
-    def get_close_timer_s(self) -> int:
-        """Return the inactivity auto-close delay stored in the metadata.
-
-        Returns
-        -------
-        int
-            Number of seconds of inactivity before the application
-            auto-saves and closes.
+    def get_lock_timer_s(self) -> int:
+        """
+        Return the inactivity delay, in seconds, before an interface locks
+        the profile (saves and closes it).
 
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+            If the profile is locked (see :meth:`unlock`).
         """
-        with self._lock:
-            self._require_decrypted()
-            return self._metadata["close_timer_s"]
+        self._require_unlocked()
+        return self._preferences["lock_timer_s"]
 
-    def set_close_timer_s(self, value: int) -> None:
-        """Set the inactivity auto-close delay stored in the metadata.
+    def set_lock_timer_s(self, value: int) -> None:
+        """
+        Set the inactivity delay before an interface locks the profile.
 
         Parameters
         ----------
@@ -1881,7 +1219,7 @@ class PasswordManager:
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+            If the profile is locked (see :meth:`unlock`).
 
         TypeError
             If ``value`` is not an ``int``.
@@ -1889,31 +1227,549 @@ class PasswordManager:
         ValueError
             If ``value`` is not strictly positive.
         """
-        if not isinstance(value, int):
-            raise TypeError(f"value must be an int, not {type(value)}")
-        if value <= 0:
-            raise ValueError(f"value must be strictly positive, not {value}")
-        with self._lock:
-            self._require_decrypted()
-            self._metadata["close_timer_s"] = value
+        self._require_unlocked()
+        self._preferences["lock_timer_s"] = _check_lock_timer(value)
 
-    def get_version(self) -> int:
+    # ----------------
+    # Vaults
+    # ----------------
+
+    def vault_uuids(self) -> tuple[str, ...]:
         """
-        Return the password manager data format version.
-
-        Returns
-        -------
-        int
-            Current data format version.
+        Return the UUIDs of the vaults, in the order of :meth:`get_vaults`.
 
         Raises
         ------
         RuntimeError
-            If :meth:`decrypt_data` has not been called yet.
+            If the profile is locked (see :meth:`unlock`).
         """
-        with self._lock:
-            self._require_decrypted()
-            return self._metadata["version"]
+        return tuple(vault.uuid for vault in self.get_vaults())
+
+    def get_vaults(self) -> list[Vault]:
+        """
+        Return every vault, sorted by name.
+
+        Returns
+        -------
+        list of Vault
+            A new list, holding the manager's own :class:`Vault`
+            instances, in alphabetical order: case- and
+            accent-insensitive, numbers by value, unnamed vaults last
+            (same rules as :meth:`Vault.sorted_items`).
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+        """
+        return _sort_items(self._require_unlocked(), "name")
+
+    def get_vault(self, vault_uuid: str) -> Vault:
+        """
+        Return a vault by UUID.
+
+        Parameters
+        ----------
+        vault_uuid : str
+            UUID of the vault.
+
+        Returns
+        -------
+        Vault
+            The vault itself (not a copy).
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        VaultNotFoundError
+            If ``vault_uuid`` is not a valid UUID, or no vault has it.
+        """
+        vaults = self._require_unlocked()
+        try:
+            return vaults[_get_uuid_index(vault_uuid, [vault.uuid for vault in vaults])]
+        except UUIDError as exc:
+            raise VaultNotFoundError(f"Unknown vault UUID: {vault_uuid}") from exc
+
+    def _add_vault(self, vault: Vault) -> None:
+        """
+        Append an existing vault, with its items (internal).
+
+        Parameters
+        ----------
+        vault : Vault
+            Vault to add, stored by reference.
+
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        TypeError
+            If ``vault`` is not a :class:`Vault`.
+
+        VaultAlreadyExistsError
+            If a vault with the same UUID is already in the manager.
+
+        ItemAlreadyExistsError
+            If one of its items has a UUID already used in the manager.
+
+
+        Notes
+        -----
+        Updates :attr:`modification_date`. The vault is left untouched:
+        UUID collisions must be resolved before.
+        """
+        vaults = self._require_unlocked()
+        if not isinstance(vault, Vault):
+            raise TypeError(f"vault must be a Vault, not {type(vault)}")
+        if vault.uuid in self.vault_uuids():
+            raise VaultAlreadyExistsError(f"Vault UUID already exists: {vault.uuid}")
+        collisions = set(vault.item_uuids()) & set(self.item_uuids())
+        if collisions:
+            raise ItemAlreadyExistsError(f"Item UUID(s) already exist: {sorted(collisions)}")
+        vaults.append(vault)
+        self._touch()
+
+    def add_empty_vault(self, name: ClearString | None = None) -> Vault:
+        """
+        Create an empty vault.
+
+        Parameters
+        ----------
+        name : ClearString or None, optional
+            Name of the new vault, stripped. Not required to be unique.
+
+        Returns
+        -------
+        Vault
+            The new vault.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        TypeError
+            If ``name`` is neither a ``str`` nor ``None``.
+
+        Notes
+        -----
+        Updates :attr:`modification_date`.
+        """
+        self._require_unlocked()
+        vault = Vault(_generate_uuid(self.vault_uuids()), name)
+        self._add_vault(vault)
+        return vault
+
+    def remove_vault(self, vault_uuid: str, *, force: bool = False) -> Vault:
+        """
+        Remove a vault.
+
+        Parameters
+        ----------
+        vault_uuid : str
+            UUID of the vault to remove.
+
+        force : bool, optional
+            If ``False`` (the default), removing a vault that still
+            holds items is refused, so that a full vault can never be
+            discarded by accident.
+
+
+        Returns
+        -------
+        Vault
+            The removed vault, with its items.
+
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        VaultNotFoundError
+            If no vault has this UUID.
+
+        ValueError
+            If the vault is not empty and ``force`` is ``False``.
+
+
+        Notes
+        -----
+        Updates :attr:`modification_date`.
+        """
+        vault = self.get_vault(vault_uuid)
+        if len(vault) and not force:
+            raise ValueError("The vault is not empty: pass force=True to remove it anyway.")
+        self._require_unlocked().remove(vault)
+        self._touch()
+        return vault
+
+    # ----------------
+    # Items
+    # ----------------
+
+    def item_uuids(self) -> tuple[str, ...]:
+        """
+        Return the UUIDs of every item of every vault.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+        """
+        return tuple(uuid for vault in self._require_unlocked() for uuid in vault.item_uuids())
+
+    def all_items(self) -> list[Item]:
+        """
+        Return every item of every vault, vault by vault.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+        """
+        return [item for vault in self._require_unlocked() for item in vault]
+
+    def find_item(self, item_uuid: str) -> tuple[Vault, Item]:
+        """
+        Find an item and the vault holding it.
+
+        Parameters
+        ----------
+        item_uuid : str
+            UUID of the item.
+
+        Returns
+        -------
+        tuple of (Vault, Item)
+            The vault holding the item, and the item itself.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        ItemNotFoundError
+            If no item of any vault has this UUID.
+        """
+        for vault in self._require_unlocked():
+            if item_uuid in vault:
+                return vault, vault.get_item(item_uuid)
+        raise ItemNotFoundError(f"Unknown item UUID: {item_uuid}")
+
+    def get_item(self, item_uuid: str) -> Item:
+        """
+        Return an item by UUID, whatever its vault.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        ItemNotFoundError
+            If no item of any vault has this UUID.
+        """
+        return self.find_item(item_uuid)[1]
+
+    def vault_of(self, item_uuid: str) -> Vault:
+        """
+        Return the vault holding an item.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        ItemNotFoundError
+            If no item of any vault has this UUID.
+        """
+        return self.find_item(item_uuid)[0]
+
+    def add_empty_item(self, vault_uuid: str) -> Item:
+        """
+        Create an empty item in a vault.
+
+        Parameters
+        ----------
+        vault_uuid : str
+            UUID of the vault receiving the item.
+
+        Returns
+        -------
+        Item
+            The new item, with a UUID unique across every vault.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        VaultNotFoundError
+            If no vault has this UUID.
+        """
+        vault = self.get_vault(vault_uuid)
+        item = Item(_generate_uuid(self.item_uuids()))
+        vault.add_item(item)
+        return item
+
+    def remove_item(self, item_uuid: str) -> Item:
+        """
+        Remove an item, whatever its vault.
+
+        Parameters
+        ----------
+        item_uuid : str
+            UUID of the item.
+
+        Returns
+        -------
+        Item
+            The removed item.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        ItemNotFoundError
+            If no item of any vault has this UUID.
+
+        Notes
+        -----
+        Updates the :attr:`Vault.modification_date` of its vault.
+        """
+        return self.vault_of(item_uuid).remove_item(item_uuid)
+
+    def move_item(self, item_uuid: str, vault_uuid: str) -> None:
+        """
+        Move an item to another vault.
+
+        Parameters
+        ----------
+        item_uuid : str
+            UUID of the item.
+
+        vault_uuid : str
+            UUID of the destination vault. Moving an item to its own
+            vault does nothing.
+
+        Raises
+        ------
+        RuntimeError
+            If the profile is locked (see :meth:`unlock`).
+
+        ItemNotFoundError
+            If no item of any vault has this UUID.
+
+        VaultNotFoundError
+            If no vault has ``vault_uuid``.
+
+        Notes
+        -----
+        A removal and an addition: both vaults'
+        :attr:`Vault.modification_date` are updated. No re-encryption
+        is ever needed: the context of encrypted values does not
+        include the vault.
+        """
+        source, item = self.find_item(item_uuid)
+        target = self.get_vault(vault_uuid)
+        if source is target:
+            return
+        source.remove_item(item_uuid)
+        target.add_item(item)
+
+    def duplicate_item(self, item_uuid: str) -> Item:
+        """
+        Duplicate an item, in the same vault.
+
+        Parameters
+        ----------
+        item_uuid : str
+            UUID of the item to duplicate.
+
+        Returns
+        -------
+        Item
+            The duplicate: a new UUID, both dates set to now, and an
+            independent copy of every value.
+
+        Raises
+        ------
+        RuntimeError
+            If the data key is not available: the duplicate's values are
+            re-encrypted under its new UUID.
+
+        ItemNotFoundError
+            If no item of any vault has this UUID.
+        """
+        data_key = self._require_decrypted()
+        vault, original = self.find_item(item_uuid)
+        data = original.to_dict()
+        now = _now()
+        data["metadata"]["creation_date"] = now
+        data["metadata"]["modification_date"] = now
+        duplicate = Item.from_dict(data)
+        duplicate.change_uuid(_generate_uuid(self.item_uuids()), data_key)
+        vault.add_item(duplicate)
+        return duplicate
+
+    # ----------------
+    # Item exchange between profiles
+    # ----------------
+
+    def export_items(
+        self,
+        path: str | Path,
+        item_uuids: Iterable[str],
+        primary_password: bytearray,
+        secondary_password: bytearray,
+        *,
+        vault_name: ClearString | None = "exported items",
+    ) -> None:
+        """
+        Export a selection of items to a new, standalone file.
+
+        Parameters
+        ----------
+        path : str or Path
+            Destination file. Replaced if it exists.
+
+        item_uuids : Iterable of str
+            UUIDs of the items to export, from any vault.
+
+        primary_password, secondary_password : bytearray
+            Passwords protecting the exported file (to be shared with
+            its recipient, not this profile's own). Erased once used.
+
+        vault_name : ClearString or None, optional
+            Name of the single vault of the exported file.
+
+
+        Raises
+        ------
+        RuntimeError
+            If the data key is not available (see :meth:`decrypt`).
+
+        ItemNotFoundError
+            If an item cannot be found. Nothing is written.
+
+        OSError
+            If the file cannot be written.
+
+
+        Notes
+        -----
+        The exported file is an ordinary version 3 file, with its own
+        random keys, holding one vault with a copy of every exported
+        item (UUIDs and dates kept), re-encrypted with its data key.
+        Items of this profile are never modified. Slow by design (two
+        full PBKDF2 derivations).
+        """
+        data_key = self._require_decrypted()
+        items = [self.get_item(uuid) for uuid in item_uuids]
+
+        export = PasswordManager.create(None, primary_password, secondary_password)
+        try:
+            vault = export.add_empty_vault(vault_name)
+            for item in items:
+                copy = item.deepcopy()
+                copy.change_data_key(data_key, export.data_key)
+                vault.add_item(copy)
+            export.save(path)
+        finally:
+            export.close()
+
+    def import_items(
+        self,
+        path: str | Path,
+        primary_password: bytearray,
+        secondary_password: bytearray,
+        *,
+        vault_uuid: str | None = None,
+        vault_name: ClearString | None = "imported items",
+    ) -> list[Item]:
+        """
+        Import every item of another file (typically from :meth:`export_items`).
+
+        Parameters
+        ----------
+        path : str or Path
+            File to import from: any version 3 file.
+
+        primary_password, secondary_password : bytearray
+            Passwords of that file. Erased once used.
+
+        vault_uuid : str or None, optional
+            UUID of the vault receiving the items. ``None`` (the
+            default) creates a new vault, named ``vault_name``.
+
+        vault_name : ClearString or None, optional
+            Name of the vault created when ``vault_uuid`` is ``None``
+            (counterpart of the ``vault_name`` of :meth:`export_items`).
+            Ignored otherwise.
+
+
+        Returns
+        -------
+        list of Item
+            The added items, in the order they were read.
+
+
+        Raises
+        ------
+        RuntimeError
+            If the data key of this manager is not available (see :meth:`decrypt`).
+
+        VaultNotFoundError
+            If no vault has ``vault_uuid``.
+
+        OSError
+            If the file cannot be read.
+
+        CorruptedFileError, UnsupportedVersionError
+            If the file cannot be opened (see :meth:`from_bytes`).
+
+        PrimaryPasswordError, SecondaryPasswordError
+            If a password of that file is wrong.
+
+
+        Notes
+        -----
+        Each item is copied and re-encrypted with this profile's data
+        key. An item whose UUID collides with one of this profile gets
+        a fresh UUID (:meth:`Item.change_uuid`); its dates are kept.
+
+        Atomic: every item is prepared first, and nothing is added
+        (nor any vault created) unless all of them succeeded.
+        """
+        data_key = self._require_decrypted()
+        target = None if vault_uuid is None else self.get_vault(vault_uuid)
+
+        source = PasswordManager.read(path)
+        try:
+            source.unlock(primary_password)
+            source.decrypt(secondary_password)
+            used = set(self.item_uuids())
+            prepared: list[Item] = []
+            for item in source.all_items():
+                copy = item.deepcopy()
+                copy.change_data_key(source.data_key, data_key)
+                if copy.uuid in used:
+                    copy.change_uuid(_generate_uuid(used), data_key)
+                used.add(copy.uuid)
+                prepared.append(copy)
+        finally:
+            source.close()
+
+        if target is None:
+            target = self.add_empty_vault(vault_name)
+        for item in prepared:
+            target.add_item(item)
+        return prepared
 
     # ----------------
     # Debug representation
@@ -1926,11 +1782,12 @@ class PasswordManager:
         Returns
         -------
         str
-            A representation built only from whether the manager has
-            been decrypted yet and, if so, how many vaults it holds,
-            never from any vault, item, or credential content, so it
-            stays safe to print or log.
+            Only the unlock state and, once unlocked, the vault count:
+            never any name, value or key.
         """
+        if self._closed:
+            return f"{type(self).__name__}(closed)"
         if self._vaults is None:
-            return f"{type(self).__name__}(decrypted=False)"
-        return f"{type(self).__name__}(decrypted=True, vaults={len(self._vaults)})"
+            return f"{type(self).__name__}(locked)"
+        state = "decrypted" if self._credentials.has_data_key else "unlocked"
+        return f"{type(self).__name__}({state}, vaults={len(self._vaults)})"

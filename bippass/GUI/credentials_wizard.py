@@ -40,15 +40,16 @@ from PyQt5.QtWidgets import (
     QWizardPage,
 )
 
-from ..core.credentials import Credentials
 from ..core.exceptions import (
-    CorruptedBase64Error,
+    CorruptedFileError,
     PrimaryPasswordError,
-    SecondaryPasswordError,
+    TamperedDataError,
+    UnsupportedVersionError,
 )
 from ..core.manager import PasswordManager
-from ..core.profiles import list_existing_profiles, profile_path
-from ..core.types import Metadata
+from ..core.profiles import ensure_profiles_dir, list_existing_profiles, profile_path
+from .tasks import run_blocking
+from .theme import load_theme
 from .translate import translator
 from .widgets import LanguageComboBox, PasswordField
 from .window import PasswordManagerWindow
@@ -60,15 +61,17 @@ from .window import PasswordManagerWindow
 
 WIZARD_TITLE = "BIPPASS"
 
-# Remembers the last vault file opened or created, to pre-fill the
+# Remembers the last profile file opened or created, to pre-fill the
 # first page.
 RECENT_FILE_PATH = Path.home() / ".bippass" / "recent.json"
 
 MODE_OPEN = "open"
 MODE_CREATE = "create"
 
-_NEW_PROFILE_FORMAT_VERSION = 1
-_PROFILES_LIST_MAX_HEIGHT_PX = 140
+_PROFILES_LIST_MAX_HEIGHT_PX = 160
+
+# Page ids, in order.
+_FILE_PAGE, _PRIMARY_PAGE, _SECONDARY_PAGE = range(3)
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +80,7 @@ _PROFILES_LIST_MAX_HEIGHT_PX = 140
 
 def _load_last_file_path() -> Path | None:
     """
-    Return the last vault file opened or created.
+    Return the last profile file opened or created.
 
     Returns
     -------
@@ -98,12 +101,12 @@ def _load_last_file_path() -> Path | None:
 
 def _remember_file_path(path: Path) -> None:
     """
-    Remember a vault file as the last one opened or created.
+    Remember a profile file as the last one opened or created.
 
     Parameters
     ----------
     path : Path
-        Vault file to remember.
+        Profile file to remember.
 
     Notes
     -----
@@ -175,12 +178,8 @@ def _unexpected_error(parent: QWidget, exc: Exception) -> None:
 
 class _FilePage(QWizardPage):
     """
-    Step 1: pick a profile or vault file to open, or a username for a
-    new profile. Also holds the wizard's language switcher.
-
-    Builds the wizard's :class:`PasswordManager` with empty
-    :class:`Credentials`, filled by the next two pages; nothing is
-    decrypted yet.
+    Step 1: pick a profile to open, or describe a new one. Also holds
+    the wizard's language switcher.
 
     Parameters
     ----------
@@ -189,10 +188,16 @@ class _FilePage(QWizardPage):
 
     Notes
     -----
-    A profile is a vault file at ``~/.bippass/profiles/<username>.encrypted``
-    (see :mod:`core.profiles`). Opening lists the existing profiles
-    and allows browsing for a file stored elsewhere; creating only asks
-    for a username and refuses one that is already taken.
+    Opening lists the profiles of :data:`core.profiles.PROFILES_DIR`
+    by their label, the only thing readable without a password, and
+    allows browsing for a file stored elsewhere. Files of an older
+    format are listed greyed out: they must be converted first.
+
+    Creating asks for a username, stored encrypted, and a label, shown
+    in this list. The label follows the username until edited; it may
+    be left empty to keep the profile anonymous. The file is named
+    after the profile's UUID, so nothing here can collide with an
+    existing profile.
     """
 
     def __init__(self, parent=None):
@@ -215,13 +220,14 @@ class _FilePage(QWizardPage):
         top_row.addWidget(self.language_combo)
         layout.addLayout(top_row)
 
-        # Open mode: existing profiles, or any vault file
+        # Open mode: existing profiles, or any profile file
         self.profiles_label = QLabel()
         layout.addWidget(self.profiles_label)
 
         self.profiles_list = QListWidget()
         self.profiles_list.setMaximumHeight(_PROFILES_LIST_MAX_HEIGHT_PX)
         self.profiles_list.itemClicked.connect(self._on_profile_clicked)
+        self.profiles_list.itemDoubleClicked.connect(self._on_profile_double_clicked)
         layout.addWidget(self.profiles_list)
 
         self.browse_label = QLabel()
@@ -236,18 +242,29 @@ class _FilePage(QWizardPage):
         file_row.addWidget(self.browse_button)
         layout.addLayout(file_row)
 
-        # Create mode: username only, the file path is derived from it
+        # Create mode: username and label
+        create_form = QFormLayout()
         self.username_label = QLabel()
         self.username_edit = QLineEdit()
-        self.username_edit.textChanged.connect(self._update_destination_label)
-        layout.addWidget(self.username_label)
-        layout.addWidget(self.username_edit)
+        self.username_edit.textEdited.connect(self._on_username_edited)
+        create_form.addRow(self.username_label, self.username_edit)
 
-        self.destination_label = QLabel()
-        self.destination_label.setObjectName("mutedLabel")
-        self.destination_label.setWordWrap(True)
-        layout.addWidget(self.destination_label)
+        self.label_label = QLabel()
+        self.label_edit = QLineEdit()
+        self.label_edit.textEdited.connect(self._on_label_edited)
+        create_form.addRow(self.label_label, self.label_edit)
+        self.create_widget = QWidget()
+        self.create_widget.setLayout(create_form)
+        layout.addWidget(self.create_widget)
+
+        self.label_hint = QLabel()
+        self.label_hint.setObjectName("mutedLabel")
+        self.label_hint.setWordWrap(True)
+        layout.addWidget(self.label_hint)
         layout.addStretch()
+
+        # Whether the label still mirrors the username.
+        self._label_follows_username = True
 
         self.retranslate()
         translator.language_changed.connect(self.retranslate)
@@ -273,14 +290,25 @@ class _FilePage(QWizardPage):
         self.file_edit.setPlaceholderText(tr("wizard.file_path_placeholder"))
         self.browse_button.setText(tr("common.browse"))
         self.username_label.setText(tr("common.username_label"))
+        self.label_label.setText(tr("common.label_label"))
+        self.label_hint.setText(tr("wizard.label_hint"))
         self._on_mode_changed()
+        self._refresh_profiles_list()
 
     def _refresh_profiles_list(self) -> None:
         """Fill :attr:`profiles_list` with the profiles currently on disk."""
+        tr = translator.translate
         self.profiles_list.clear()
-        for username in list_existing_profiles():
-            row = QListWidgetItem(username)
-            row.setData(Qt.UserRole, str(profile_path(username)))
+        for entry in list_existing_profiles():
+            name = entry.label or tr("common.anonymous_profile")
+            date = entry.modified.strftime("%Y-%m-%d %H:%M")
+            text = tr("wizard.profile_row", name=name, date=date)
+            row = QListWidgetItem(text)
+            row.setData(Qt.UserRole, str(entry.path))
+            row.setToolTip(str(entry.path))
+            if not entry.supported:
+                row.setText(tr("wizard.profile_row_unsupported", row=text))
+                row.setFlags(row.flags() & ~Qt.ItemIsEnabled & ~Qt.ItemIsSelectable)
             self.profiles_list.addItem(row)
 
     def _on_profile_clicked(self, row: QListWidgetItem) -> None:
@@ -292,11 +320,48 @@ class _FilePage(QWizardPage):
         row : QListWidgetItem
             The clicked profile row.
         """
-        self.file_edit.setText(row.data(Qt.UserRole))
+        if row.flags() & Qt.ItemIsEnabled:
+            self.file_edit.setText(row.data(Qt.UserRole))
+
+    def _on_profile_double_clicked(self, row: QListWidgetItem) -> None:
+        """
+        Pick a profile and go on to the password page.
+
+        Parameters
+        ----------
+        row : QListWidgetItem
+            The double-clicked profile row.
+        """
+        if row.flags() & Qt.ItemIsEnabled:
+            self.file_edit.setText(row.data(Qt.UserRole))
+            self.wizard().next()
 
     def _on_language_changed(self) -> None:
         """Switch the display language to the one picked."""
         translator.set_language(self.language_combo.language())
+
+    def _on_username_edited(self, text: str) -> None:
+        """
+        Mirror the username into the label, until the label is edited.
+
+        Parameters
+        ----------
+        text : str
+            The new username.
+        """
+        if self._label_follows_username:
+            self.label_edit.setText(text)
+
+    def _on_label_edited(self, text: str) -> None:
+        """
+        Stop mirroring the username once the label is edited by hand.
+
+        Parameters
+        ----------
+        text : str
+            The new label; clearing it mirrors the username again.
+        """
+        self._label_follows_username = not text
 
     def _is_creating(self) -> bool:
         """
@@ -325,28 +390,18 @@ class _FilePage(QWizardPage):
             self.browse_button,
         ):
             widget.setVisible(not creating)
-        for widget in (self.username_label, self.username_edit, self.destination_label):
-            widget.setVisible(creating)
-        self._update_destination_label()
-
-    def _update_destination_label(self) -> None:
-        """Show where the new profile will be saved, as the username is typed."""
-        username = self.username_edit.text().strip()
-        self.destination_label.setText(
-            translator.translate("wizard.destination_label", path=str(profile_path(username)))
-            if username
-            else ""
-        )
+        self.create_widget.setVisible(creating)
+        self.label_hint.setVisible(creating)
 
     def _browse(self) -> None:
-        """Pick a vault file, starting next to the current one or in the home folder."""
+        """Pick a profile file, starting next to the current one or in the home folder."""
         current = Path(self.file_edit.text().strip() or Path.home())
         start = current.parent if current.is_file() else Path.home()
         filename, _filter = QFileDialog.getOpenFileName(
             self,
             translator.translate("wizard.select_vault_file_dialog_title"),
             str(start),
-            translator.translate("common.vault_files_filter"),
+            translator.translate("common.profile_files_filter"),
         )
         if filename:
             self.file_edit.setText(filename)
@@ -354,7 +409,7 @@ class _FilePage(QWizardPage):
 
     def validatePage(self) -> bool:
         """
-        Prepare the wizard's manager for the selected mode.
+        Record the choice of this page in the wizard.
 
         Returns
         -------
@@ -364,129 +419,66 @@ class _FilePage(QWizardPage):
         """
         wizard: CredentialsWizard = self.wizard()
         if self._is_creating():
-            return self._prepare_new_profile(wizard)
-        return self._prepare_existing_file(wizard)
+            wizard.start_create(
+                self.username_edit.text().strip() or None,
+                self.label_edit.text().strip() or None,
+            )
+            return True
+        return self._read_existing_file(wizard)
 
-    def _prepare_new_profile(self, wizard: CredentialsWizard) -> bool:
+    def _read_existing_file(self, wizard: CredentialsWizard) -> bool:
         """
-        Build an empty manager for a new profile.
+        Read an existing profile file into a still-locked manager.
 
         Parameters
         ----------
         wizard : CredentialsWizard
-            The wizard, receiving the mode, file path and manager.
+            The wizard, receiving the file path and manager.
 
         Returns
         -------
         bool
-            ``False`` if the username is empty or taken, or the
-            profiles folder can't be created.
-
-        Notes
-        -----
-        The new profile starts in the language chosen in the wizard.
+            ``False`` if no file is given, or it can't be read as a
+            profile of the current format.
         """
-        username = self.username_edit.text().strip()
-        if not username:
-            _warn(
-                self,
-                "wizard.missing_username_title",
-                translator.translate("wizard.missing_username_message"),
-            )
-            return False
-
-        path = profile_path(username)
-        if path.exists():
-            _warn(
-                self,
-                "wizard.profile_exists_title",
-                translator.translate("wizard.profile_exists_message", username=username),
-            )
-            return False
-
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            _error(
-                self,
-                "wizard.folder_error_title",
-                translator.translate("wizard.folder_error_message", error=str(exc)),
-            )
-            return False
-
-        metadata: Metadata = {"username": username, "version": _NEW_PROFILE_FORMAT_VERSION}
-        credentials = Credentials()
-        try:
-            manager = PasswordManager.new(metadata, credentials)
-            manager.set_language(translator.language)
-        except Exception as exc:
-            _unexpected_error(self, exc)
-            return False
-
-        wizard.start(MODE_CREATE, path, manager, credentials)
-        return True
-
-    def _prepare_existing_file(self, wizard: CredentialsWizard) -> bool:
-        """
-        Read an existing vault file into a still-locked manager.
-
-        Parameters
-        ----------
-        wizard : CredentialsWizard
-            The wizard, receiving the mode, file path and manager.
-
-        Returns
-        -------
-        bool
-            ``False`` if no file is given, it doesn't exist or can't be
-            read.
-        """
+        tr = translator.translate
         path_text = self.file_edit.text().strip()
         if not path_text:
-            _warn(
-                self,
-                "wizard.missing_file_title",
-                translator.translate("wizard.missing_file_message"),
-            )
+            _warn(self, "wizard.missing_file_title", tr("wizard.missing_file_message"))
             return False
 
         path = Path(path_text)
         if not path.is_file():
-            _warn(
-                self,
-                "wizard.file_not_found_title",
-                translator.translate("wizard.file_not_found_message", path=str(path)),
-            )
+            _warn(self, "wizard.file_not_found_title", tr("wizard.file_not_found_message", path=str(path)))
             return False
 
         try:
-            data = bytearray(path.read_bytes())
+            manager = PasswordManager.read(path)
         except OSError as exc:
-            _error(
-                self,
-                "wizard.read_error_title",
-                translator.translate("wizard.read_error_message", error=str(exc)),
-            )
+            _error(self, "wizard.read_error_title", tr("wizard.read_error_message", error=str(exc)))
             return False
-
-        credentials = Credentials()
-        try:
-            manager = PasswordManager(data, credentials)
+        except UnsupportedVersionError as exc:
+            _error(self, "wizard.invalid_vault_title", tr("wizard.unsupported_version_message", error=str(exc)))
+            return False
+        except CorruptedFileError as exc:
+            _error(self, "wizard.invalid_vault_title", tr("wizard.invalid_vault_message", error=str(exc)))
+            return False
         except Exception as exc:
             _unexpected_error(self, exc)
             return False
 
-        wizard.start(MODE_OPEN, path, manager, credentials)
+        wizard.start_open(path, manager)
         return True
 
 
 class _PasswordPage(QWizardPage):
     """
     Base of the steps asking for one password: entered to unlock an
-    existing vault, or chosen (with a confirmation) for a new one.
+    existing profile, or chosen (with a confirmation) for a new one.
 
     Subclasses set the translation keys and implement
-    :meth:`_apply_create` and :meth:`_apply_open`.
+    :meth:`_apply_create` and, if they are part of the open mode,
+    :meth:`_apply_open`.
 
     Parameters
     ----------
@@ -529,6 +521,11 @@ class _PasswordPage(QWizardPage):
     def initializePage(self) -> None:
         """Adapt the subtitle and confirmation field to the wizard's mode."""
         self._update_mode()
+        self.password_field.edit.setFocus()
+
+    def cleanupPage(self) -> None:
+        """Erase the typed passwords when going back."""
+        self.clear()
 
     @pyqtSlot()
     def retranslate(self) -> None:
@@ -567,12 +564,16 @@ class _PasswordPage(QWizardPage):
 
         wizard: CredentialsWizard = self.wizard()
         if not self._is_creating():
-            return self._apply_open(wizard, self.password_field.to_bytearray())
+            password_bytes = self.password_field.to_bytearray()
+            self.clear()
+            return self._apply_open(wizard, password_bytes)
 
         if password != self.confirm_field.text():
             _warn(self, "wizard.mismatch_title", translator.translate("wizard.mismatch_message"))
             return False
-        return self._apply_create(wizard, self.password_field.to_bytearray())
+        password_bytes = self.password_field.to_bytearray()
+        self.clear()
+        return self._apply_create(wizard, password_bytes)
 
     def clear(self) -> None:
         """Erase the entered passwords."""
@@ -588,7 +589,7 @@ class _PasswordPage(QWizardPage):
         wizard : CredentialsWizard
             The wizard.
         password : bytearray
-            The confirmed password.
+            The confirmed password, now owned by this method.
 
         Returns
         -------
@@ -599,14 +600,14 @@ class _PasswordPage(QWizardPage):
 
     def _apply_open(self, wizard: CredentialsWizard, password: bytearray) -> bool:
         """
-        Check an entered password against the opened vault.
+        Use an entered password on the opened profile.
 
         Parameters
         ----------
         wizard : CredentialsWizard
             The wizard.
         password : bytearray
-            The entered password.
+            The entered password, now owned by this method.
 
         Returns
         -------
@@ -618,7 +619,11 @@ class _PasswordPage(QWizardPage):
 
 class _PrimaryPage(_PasswordPage):
     """
-    Step 2: the primary password, which decrypts the vault file.
+    Step 2: the primary password, which unlocks the profile.
+
+    In open mode this is the last page: the secondary password is only
+    asked later, the first time a secret is needed (see
+    :func:`unlock.ensure_decrypted`).
 
     Parameters
     ----------
@@ -630,9 +635,20 @@ class _PrimaryPage(_PasswordPage):
     _subtitle_create_key = "wizard.primary_subtitle_create"
     _subtitle_open_key = "wizard.primary_subtitle_open"
 
+    def nextId(self) -> int:
+        """
+        Return the next page: none when opening, the secondary password when creating.
+
+        Returns
+        -------
+        int
+            ``-1`` (last page) in open mode, else the secondary page id.
+        """
+        return _SECONDARY_PAGE if self._is_creating() else -1
+
     def _apply_create(self, wizard: CredentialsWizard, password: bytearray) -> bool:
         """
-        Record the primary password of the new profile.
+        Keep the primary password of the new profile until the next page.
 
         Parameters
         ----------
@@ -646,53 +662,47 @@ class _PrimaryPage(_PasswordPage):
         bool
             Always ``True``.
         """
-        wizard.credentials.set_primary_password(password)
+        wizard.set_new_primary_password(password)
         return True
 
     def _apply_open(self, wizard: CredentialsWizard, password: bytearray) -> bool:
         """
-        Decrypt the vault with the entered primary password.
+        Unlock the profile with the entered primary password.
 
         Parameters
         ----------
         wizard : CredentialsWizard
             The wizard.
         password : bytearray
-            The entered password.
+            The entered password, erased by the manager.
 
         Returns
         -------
         bool
-            ``False`` if the password is wrong or the vault invalid.
+            ``False`` if the password is wrong or the profile invalid.
         """
-        wizard.credentials.set_primary_password(password)
+        tr = translator.translate
         try:
-            wizard.manager.decrypt_data()
+            run_blocking(self, tr("unlock.unlocking"), lambda: wizard.manager.unlock(password))
         except PrimaryPasswordError:
-            _error(
-                self,
-                "wizard.wrong_credentials_title",
-                translator.translate("wizard.wrong_primary_credentials_message"),
-            )
+            _error(self, "wizard.wrong_credentials_title", tr("wizard.wrong_primary_credentials_message"))
             return False
-        except ValueError as exc:
-            _error(
-                self,
-                "wizard.invalid_vault_title",
-                translator.translate("wizard.invalid_vault_message", error=str(exc)),
-            )
+        except (TamperedDataError, CorruptedFileError) as exc:
+            _error(self, "wizard.invalid_vault_title", tr("wizard.invalid_vault_message", error=str(exc)))
             return False
         except Exception as exc:
             _unexpected_error(self, exc)
             return False
+        _remember_file_path(wizard.file_path)
         return True
 
 
 class _SecondaryPage(_PasswordPage):
     """
-    Step 3: the secondary password, which encrypts individual secrets.
+    Step 3, when creating only: the secondary password, which protects
+    the secrets.
 
-    When creating, the new vault is written to disk right away, so
+    The new profile is created and written to disk right away, so
     nothing is lost if the application closes before the next save.
 
     Parameters
@@ -703,77 +713,56 @@ class _SecondaryPage(_PasswordPage):
 
     _title_key = "wizard.secondary_page_title"
     _subtitle_create_key = "wizard.secondary_subtitle_create"
-    _subtitle_open_key = "wizard.secondary_subtitle_open"
+    _subtitle_open_key = "wizard.secondary_subtitle_create"
 
     def _apply_create(self, wizard: CredentialsWizard, password: bytearray) -> bool:
         """
-        Record the secondary password and write the new vault.
+        Create the new profile and write it.
 
         Parameters
         ----------
         wizard : CredentialsWizard
             The wizard.
         password : bytearray
-            The confirmed password.
+            The confirmed secondary password, erased by the manager.
 
         Returns
         -------
         bool
-            ``False`` if the vault file can't be written.
+            ``False`` if the profile can't be created or written.
         """
-        wizard.credentials.set_secondary_password(password)
+        tr = translator.translate
         try:
-            wizard.manager.save_changes(wizard.file_path)
+            manager = run_blocking(
+                self,
+                tr("wizard.creating"),
+                lambda: PasswordManager.create(
+                    wizard.new_username,
+                    wizard.take_new_primary_password(),
+                    password,
+                    label=wizard.new_label,
+                ),
+            )
+            manager.set_language(translator.language)
+            manager.set_theme(load_theme())
+        except Exception as exc:
+            _unexpected_error(self, exc)
+            # Both passwords are erased: start the passwords again.
+            wizard.restart_passwords()
+            return False
+
+        try:
+            ensure_profiles_dir()
+            path = profile_path(manager.uuid)
+            manager.save(path)
         except OSError as exc:
-            _error(
-                self,
-                "wizard.write_error_title",
-                translator.translate("wizard.write_error_message", error=str(exc)),
-            )
+            manager.close()
+            _error(self, "wizard.write_error_title", tr("wizard.write_error_message", error=str(exc)))
+            wizard.restart_passwords()
             return False
-        except Exception as exc:
-            _unexpected_error(self, exc)
-            return False
-        _remember_file_path(wizard.file_path)
-        return True
 
-    def _apply_open(self, wizard: CredentialsWizard, password: bytearray) -> bool:
-        """
-        Check the entered secondary password against the vault.
-
-        Parameters
-        ----------
-        wizard : CredentialsWizard
-            The wizard.
-        password : bytearray
-            The entered password.
-
-        Returns
-        -------
-        bool
-            ``False`` if the password is wrong or the vault corrupted.
-        """
-        wizard.credentials.set_secondary_password(password)
-        try:
-            wizard.manager.check_secondary()
-        except SecondaryPasswordError:
-            _error(
-                self,
-                "wizard.wrong_credentials_title",
-                translator.translate("wizard.wrong_secondary_credentials_message"),
-            )
-            return False
-        except CorruptedBase64Error:
-            _error(
-                self,
-                "wizard.corrupted_vault_title",
-                translator.translate("wizard.corrupted_vault_message"),
-            )
-            return False
-        except Exception as exc:
-            _unexpected_error(self, exc)
-            return False
-        _remember_file_path(wizard.file_path)
+        wizard.finish_create(path, manager)
+        _remember_file_path(path)
         return True
 
 
@@ -783,12 +772,12 @@ class _SecondaryPage(_PasswordPage):
 
 class CredentialsWizard(QWizard):
     """
-    Three-step wizard opening an existing vault or creating a new one:
+    Wizard opening an existing profile or creating a new one.
 
-    1. :class:`_FilePage`: the profile or file to open, or the
-       username of a new profile;
-    2. :class:`_PrimaryPage`: the primary password;
-    3. :class:`_SecondaryPage`: the secondary password.
+    Opening takes two steps: :class:`_FilePage` (the profile) then
+    :class:`_PrimaryPage` (the primary password, which unlocks it).
+    Creating takes three: the username and label, then both passwords,
+    each confirmed (:class:`_PrimaryPage`, :class:`_SecondaryPage`).
 
     On success, the wizard opens the :class:`PasswordManagerWindow`
     itself.
@@ -803,11 +792,12 @@ class CredentialsWizard(QWizard):
     mode : str
         :data:`MODE_OPEN` or :data:`MODE_CREATE`, set by the first page.
     file_path : Path or None
-        The vault file opened or created.
-    credentials : Credentials
-        Filled by the password pages.
+        The profile file opened or created.
     manager : PasswordManager or None
-        Built by the first page, usable once every page is done.
+        In open mode, read by the first page and unlocked by the
+        second; in create mode, created by the last page.
+    new_username, new_label : str or None
+        In create mode, entered on the first page.
     main_window : PasswordManagerWindow or None
         The window opened on success, kept so it isn't garbage
         collected once the wizard closes.
@@ -820,43 +810,115 @@ class CredentialsWizard(QWizard):
 
         self.mode = MODE_OPEN
         self.file_path: Path | None = None
-        self.credentials = Credentials()
         self.manager: PasswordManager | None = None
+        self.new_username: str | None = None
+        self.new_label: str | None = None
         self.main_window: PasswordManagerWindow | None = None
+        self._new_primary: bytearray | None = None
 
         self._password_pages = (_PrimaryPage(self), _SecondaryPage(self))
-        self.addPage(_FilePage(self))
-        for page in self._password_pages:
-            self.addPage(page)
+        self.setPage(_FILE_PAGE, _FilePage(self))
+        self.setPage(_PRIMARY_PAGE, self._password_pages[0])
+        self.setPage(_SECONDARY_PAGE, self._password_pages[1])
 
         self.finished.connect(self._on_finished)
 
-    def start(
-        self,
-        mode: str,
-        file_path: Path,
-        manager: PasswordManager,
-        credentials: Credentials,
-    ) -> None:
+    # -- open mode ----------------------------------------------------------
+
+    def start_open(self, file_path: Path, manager: PasswordManager) -> None:
         """
-        Record the vault chosen on the first page.
+        Record the profile picked on the first page.
 
         Parameters
         ----------
-        mode : str
-            :data:`MODE_OPEN` or :data:`MODE_CREATE`.
         file_path : Path
-            The vault file.
+            The profile file.
         manager : PasswordManager
-            Manager built for that file, still locked.
-        credentials : Credentials
-            Empty credentials shared with ``manager``, filled by the
-            password pages.
+            Manager read from that file, still locked.
         """
-        self.mode = mode
+        self._discard_manager()
+        self.mode = MODE_OPEN
         self.file_path = file_path
         self.manager = manager
-        self.credentials = credentials
+
+    # -- create mode --------------------------------------------------------
+
+    def start_create(self, username: str | None, label: str | None) -> None:
+        """
+        Record the description of the new profile entered on the first page.
+
+        Parameters
+        ----------
+        username : str or None
+            Username, stored encrypted.
+        label : str or None
+            Label, readable without a password; ``None`` keeps the
+            profile anonymous.
+        """
+        self._discard_manager()
+        self.mode = MODE_CREATE
+        self.new_username = username
+        self.new_label = label
+
+    def set_new_primary_password(self, password: bytearray) -> None:
+        """
+        Keep the chosen primary password until the profile is created.
+
+        Parameters
+        ----------
+        password : bytearray
+            The password; a previously kept one is erased.
+        """
+        self._erase_new_primary()
+        self._new_primary = password
+
+    def take_new_primary_password(self) -> bytearray:
+        """
+        Hand over the kept primary password.
+
+        Returns
+        -------
+        bytearray
+            The password, no longer kept by the wizard: the caller (the
+            manager) erases it.
+        """
+        password, self._new_primary = self._new_primary, None
+        if password is None:
+            raise RuntimeError("No primary password was chosen.")
+        return password
+
+    def restart_passwords(self) -> None:
+        """Go back to the primary password page after a failed creation."""
+        self._erase_new_primary()
+        self.back()
+
+    def finish_create(self, file_path: Path, manager: PasswordManager) -> None:
+        """
+        Record the newly created profile.
+
+        Parameters
+        ----------
+        file_path : Path
+            Where it was written.
+        manager : PasswordManager
+            The created manager, unlocked and decrypted.
+        """
+        self.file_path = file_path
+        self.manager = manager
+
+    # -- end ----------------------------------------------------------------
+
+    def _erase_new_primary(self) -> None:
+        """Erase the kept primary password, if any."""
+        if self._new_primary is not None:
+            self._new_primary[:] = bytes(len(self._new_primary))
+            self._new_primary = None
+
+    def _discard_manager(self) -> None:
+        """Close a manager read earlier, when the user goes back and picks again."""
+        if self.manager is not None:
+            self.manager.close()
+            self.manager = None
 
     def _on_finished(self, result: int) -> None:
         """
@@ -869,7 +931,9 @@ class CredentialsWizard(QWizard):
         """
         for page in self._password_pages:
             page.clear()
-        if result != QDialog.Accepted:
+        self._erase_new_primary()
+        if result != QDialog.Accepted or self.manager is None or not self.manager.is_unlocked:
+            self._discard_manager()
             return
         self.main_window = PasswordManagerWindow(self.manager, self.file_path)
         self.main_window.show()

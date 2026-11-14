@@ -16,7 +16,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from typing import TypeAlias, TypedDict, Dict, Tuple, Literal, List
+from typing import TypeAlias, TypedDict, Literal, List
 
 ClearString: TypeAlias = str
 ClearSecretBytes: TypeAlias = bytearray # Secrets to erase
@@ -26,45 +26,90 @@ ClearStringList: TypeAlias = List[ClearString]
 ClearSecretBytesList: TypeAlias = List[ClearSecretBytes]
 CryptedBase64StringList: TypeAlias = List[CryptedBase64String]
 
-ItemKind: TypeAlias = Literal[
-    "SCALAR", "ENCRYPTED",
-    "SCALAR LIST", "ENCRYPTED LIST"
+#: Predefined clear fields of an item (see :class:`Item`).
+ClearField: TypeAlias = Literal["logins", "websites", "emails", "phones"]
+
+#: Predefined encrypted fields of an item.
+SecretField: TypeAlias = Literal["passwords", "totps"]
+
+#: Predefined fields of an item.
+ItemField: TypeAlias = Literal[
+    "logins", "websites", "emails", "phones",
+    "passwords", "totps",
 ]
 
-CustomFieldData: TypeAlias = Tuple[
-    ItemKind,
-    ClearString
-    | CryptedBase64String
-    | ClearStringList
-    | CryptedBase64StringList,
-]
-CustomFieldsMap: TypeAlias = Dict[str, CustomFieldData]
+#: Kind of a custom field, as serialized (see :class:`FieldKind`).
+CustomKind: TypeAlias = Literal["clear", "encrypted"]
+
+class ItemMetadataData(TypedDict):
+    uuid: str
+    name: ClearString | None
+    creation_date: ClearString
+    modification_date: ClearString
+
+class ItemFieldsData(TypedDict):
+    logins: ClearStringList
+    websites: ClearStringList
+    emails: ClearStringList
+    phones: ClearStringList
+    passwords: CryptedBase64StringList
+    totps: CryptedBase64StringList
+
+class CustomFieldData(TypedDict):
+    id: str
+    name: ClearString
+    kind: CustomKind
+    values: ClearStringList | CryptedBase64StringList
+
+class ItemGuiData(TypedDict):
+    icon: ClearString | None
+    color: ClearString | None
 
 class ItemData(TypedDict):
-    item_name: ClearString | None
-    item_date: ClearString | None
+    """Serialized item, format version 3 (see :meth:`Item.to_dict`)."""
+    metadata: ItemMetadataData
+    fields: ItemFieldsData
+    customs: List[CustomFieldData]
+    gui: ItemGuiData
+
+class VaultMetadataData(TypedDict):
+    uuid: str
+    name: ClearString | None
+    creation_date: ClearString
+    modification_date: ClearString
+
+class VaultGuiData(TypedDict):
     icon: ClearString | None
-    logins: ClearStringList | None
-    passwords: CryptedBase64StringList | None
-    totps: CryptedBase64StringList | None
-    websites: ClearStringList | None
-    phones: ClearStringList | None
-    emails: ClearStringList | None
-    custom: CustomFieldsMap | None
+    color: ClearString | None
 
 class VaultData(TypedDict):
-    icon: ClearString | None
-    icon_color: ClearString | None
-    items: dict[str, ItemData]
+    """Serialized vault, format version 3 (see :meth:`Vault.to_dict`)."""
+    metadata: VaultMetadataData
+    items: List[ItemData]
+    gui: VaultGuiData
 
-class Metadata(TypedDict):
-    version: int
+class ManagerMetadataData(TypedDict):
+    uuid: str
     username: ClearString | None
+    creation_date: ClearString
+    modification_date: ClearString
+
+class PreferencesData(TypedDict):
     theme: ClearString | None
     language: ClearString | None
-    close_timer_s: int | None
+    lock_timer_s: int
 
-class PasswordManagerData(TypedDict):
-    metadata: Metadata
-    auth: CryptedBase64String
-    vaults: dict[str, VaultData]
+class PayloadData(TypedDict):
+    """Decrypted content of a file, format version 3 (see :meth:`PasswordManager.to_bytes`)."""
+    metadata: ManagerMetadataData
+    secondary_key: CryptedBase64String
+    vaults: List[VaultData]
+    preferences: PreferencesData
+
+class EnvelopeData(TypedDict):
+    """Outer, unencrypted structure of a file, format version 3."""
+    format: Literal["bippass"]
+    version: int
+    label: ClearString | None
+    primary_key: CryptedBase64String
+    payload: CryptedBase64String

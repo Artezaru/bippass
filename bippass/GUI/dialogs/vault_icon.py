@@ -19,7 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
 
 from PyQt5.QtCore import QSize, Qt
-from PyQt5.QtGui import QColor, QIcon, QPainter, QPixmap
+from PyQt5.QtGui import QColor, QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QButtonGroup,
     QColorDialog,
@@ -33,33 +33,31 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from ..common import _vault_icon_names, _vault_icon_path
+from ..common import (
+    _VAULT_ICONS_DIR,
+    _bundled_icon_name,
+    _file_to_base64,
+    _vault_icon_names,
+    _vault_icon_path,
+    tint_pixmap,
+    vault_icon_pixmap,
+)
+from ..theme import DARK, LIGHT, load_theme
 from ..translate import translator
-from ..widgets import ok_cancel_buttons
+from ..widgets import ColorSwatch, ok_cancel_buttons, small_button
 
 
-_ICON_BUTTON_SIZE_PX = 64
 _ICON_SIZE_PX = 40
-_GRID_COLUMNS = 4
+_PREVIEW_SIZE_PX = 64
+_GRID_COLUMNS = 5
 
-# Native color of the bundled icons (plain black shapes).
-_DEFAULT_COLOR = "#000000"
+# Key of the button showing a stored icon that isn't a bundled one.
+_CURRENT = "\x00current"
 
-# Explicit selection highlight: the platform's own "checked" look is too
-# subtle on some styles to read as a selection.
-_ICON_BUTTON_STYLE = """
-    QPushButton {
-        border: 2px solid transparent;
-        border-radius: 6px;
-    }
-    QPushButton:checked {
-        border: 2px solid #3478f6;
-        background-color: rgba(52, 120, 246, 40);
-    }
-    QPushButton:hover:!checked {
-        border: 2px solid #888888;
-    }
-"""
+# Color of the shapes drawn on the buttons, by theme: the text color,
+# so that they read well whatever the color being chosen. Also the
+# color proposed when the vault has none yet.
+_SHAPE_COLORS = {LIGHT: "#000000", DARK: "#FFFFFF"}
 
 
 # ---------------------------------------------------------------------------
@@ -94,63 +92,6 @@ def load_vault_icon_pixmap(name: str | None) -> QPixmap | None:
     return None if pixmap.isNull() else pixmap
 
 
-def tint_pixmap(pixmap: QPixmap, color: QColor) -> QPixmap:
-    """
-    Recolor every non-transparent pixel of a pixmap.
-
-    Parameters
-    ----------
-    pixmap : QPixmap
-        Source icon, whatever its original color(s).
-    color : QColor
-        Color to paint the icon's shape with.
-
-    Returns
-    -------
-    QPixmap
-        A new pixmap the same size as ``pixmap``, with the same alpha
-        shape, filled with ``color``.
-    """
-    tinted = QPixmap(pixmap.size())
-    tinted.fill(Qt.transparent)
-    painter = QPainter(tinted)
-    painter.drawPixmap(0, 0, pixmap)
-    # SourceIn keeps the destination's alpha and replaces its color,
-    # so the transparent background stays transparent.
-    painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
-    painter.fillRect(tinted.rect(), QColor(color))
-    painter.end()
-    return tinted
-
-
-def vault_icon_pixmap(name: str | None, color: str | None = None) -> QPixmap | None:
-    """
-    Load, and optionally tint, the pixmap of a vault's icon.
-
-    Parameters
-    ----------
-    name : str or None
-        Vault icon filename (``Vault.get_icon()``).
-    color : str or None, optional
-        Vault icon color (``Vault.get_icon_color()``, e.g.
-        ``"#3478f6"``). The icon is left untinted if empty or not a
-        color Qt can parse.
-
-    Returns
-    -------
-    QPixmap or None
-        ``None`` if ``name`` is empty or unresolvable; callers should
-        then show no icon at all, never a placeholder.
-    """
-    pixmap = load_vault_icon_pixmap(name)
-    if pixmap is None or not color:
-        return pixmap
-    qcolor = QColor(color)
-    if not qcolor.isValid():
-        return pixmap
-    return tint_pixmap(pixmap, qcolor)
-
-
 # ---------------------------------------------------------------------------
 # Dialog
 # ---------------------------------------------------------------------------
@@ -160,18 +101,24 @@ class VaultIconDialog(QDialog):
     Dialog to pick a vault's icon and its color.
 
     Every bundled ``resources/vault_icons/*.png`` is shown as a
-    selectable button, next to a "None" button (no icon). Choosing a
-    color re-tints every button live, so the preview always matches
-    what would be saved.
+    selectable square button (just an outline, ``iconChoiceButton`` in
+    ``theme.py``, which also sets its size), next to a "None" button
+    (no icon), in a grid scrolling vertically. The shapes are
+    drawn in the text color of the theme, black or white, whatever the
+    chosen color: a preview next to the color shows the result, the
+    picked shape in the picked color, on the background of the vault
+    list.
 
     Parameters
     ----------
     current_icon : str or None
-        The vault's current icon filename (``Vault.get_icon()``), used
-        to pre-select a button.
+        The vault's current icon, a Base64 image (``Vault.get_icon()``).
+        The matching bundled icon is pre-selected; an icon that matches
+        none (e.g. from another version) gets its own button, so it
+        can be kept.
     current_color : str or None
-        The vault's current icon color (``Vault.get_icon_color()``);
-        black if not set or invalid.
+        The vault's current color (``Vault.get_color()``); the theme's
+        text color (see :data:`_SHAPE_COLORS`) if not set or invalid.
     parent : QWidget, optional
         Parent widget.
     """
@@ -183,66 +130,107 @@ class VaultIconDialog(QDialog):
         parent=None,
     ):
         super().__init__(parent)
-        self.setWindowTitle(translator.translate("vault_icon.dialog_title"))
-        self.resize(420, 460)
+        tr = translator.translate
+        self.setWindowTitle(tr("vault_icon.dialog_title"))
+        self.resize(420, 520)
 
-        color = QColor(current_color or _DEFAULT_COLOR)
-        self._color = color if color.isValid() else QColor(_DEFAULT_COLOR)
-        self._selected_icon: str | None = current_icon
+        shape_color = QColor(_SHAPE_COLORS.get(load_theme(), "#000000"))
+        color = QColor(current_color) if current_color else QColor()
+        self._color = color if color.isValid() else shape_color
+        self._current_icon = current_icon
 
-        # Loaded once; a color change only re-tints them.
         self._pixmaps: dict[str, QPixmap] = {}
         for name in _vault_icon_names():
             pixmap = load_vault_icon_pixmap(name)
             if pixmap is not None:
                 self._pixmaps[name] = pixmap
-        self._buttons: dict[str | None, QPushButton] = {}
 
         layout = QVBoxLayout(self)
 
+        # Every bundled icon gets a button, in a grid of fixed columns
+        # that scrolls vertically: adding icons to `resources/vault_icons`
+        # needs no change here.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         grid_widget = QWidget()
         grid = QGridLayout(grid_widget)
         grid.setSpacing(8)
+        grid.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
         scroll.setWidget(grid_widget)
         layout.addWidget(scroll, stretch=1)
 
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
 
+        current_key = self._find_current_key(current_icon)
+        current_pixmap = vault_icon_pixmap(current_icon) if current_key == _CURRENT else None
+        if current_pixmap is not None:
+            self._pixmaps[_CURRENT] = current_pixmap
+        self._selected_icon: str | None = current_key
+
         names: list[str | None] = [None, *self._pixmaps]
-        for index, name in enumerate(names):
+        for index, icon_name in enumerate(names):
             btn = QPushButton()
+            btn.setObjectName("iconChoiceButton")
             btn.setCheckable(True)
-            btn.setFixedSize(_ICON_BUTTON_SIZE_PX, _ICON_BUTTON_SIZE_PX)
             btn.setIconSize(QSize(_ICON_SIZE_PX, _ICON_SIZE_PX))
-            btn.setStyleSheet(_ICON_BUTTON_STYLE)
-            # The "None" label gets clipped at this fixed size, so it
-            # only lives in the tooltip.
-            btn.setToolTip(
-                translator.translate("vault_icon.none_label") if name is None else name
-            )
-            btn.setChecked(name == current_icon)
-            btn.clicked.connect(lambda _checked, n=name: self._select_icon(n))
+            if icon_name is None:
+                btn.setText("∅")
+                btn.setToolTip(tr("vault_icon.none_label"))
+            else:
+                btn.setIcon(QIcon(tint_pixmap(self._pixmaps[icon_name], shape_color)))
+                btn.setToolTip(tr("vault_icon.current_label") if icon_name == _CURRENT else icon_name)
+            btn.setChecked(icon_name == current_key)
+            btn.clicked.connect(lambda _checked, n=icon_name: self._select_icon(n))
             self._group.addButton(btn)
-            self._buttons[name] = btn
             grid.addWidget(btn, index // _GRID_COLUMNS, index % _GRID_COLUMNS)
-        self._retint_buttons()
 
-        color_row = QHBoxLayout()
-        self.color_preview = QLabel()
-        self.color_preview.setFixedSize(28, 28)
-        self._update_color_preview()
-        color_row.addWidget(self.color_preview)
-
-        self.color_button = QPushButton(translator.translate("vault_icon.color_button"))
+        bottom = QHBoxLayout()
+        self.color_swatch = ColorSwatch(self._color.name())
+        bottom.addWidget(self.color_swatch)
+        self.color_button = small_button(tr("vault_icon.color_button"))
         self.color_button.clicked.connect(self._choose_color)
-        color_row.addWidget(self.color_button)
-        color_row.addStretch()
-        layout.addLayout(color_row)
+        bottom.addWidget(self.color_button)
+        bottom.addStretch()
+        bottom.addWidget(QLabel(tr("vault_icon.preview_label")))
+        self.preview = QLabel()
+        self.preview.setObjectName("iconPreview")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setFixedSize(_PREVIEW_SIZE_PX + 16, _PREVIEW_SIZE_PX + 16)
+        bottom.addWidget(self.preview)
+        layout.addLayout(bottom)
 
         layout.addWidget(ok_cancel_buttons(self))
+        self._update_preview()
+
+    def _find_current_key(self, current_icon: str | None) -> str | None:
+        """
+        Find which button stands for the vault's current icon.
+
+        Parameters
+        ----------
+        current_icon : str or None
+            The stored Base64 icon.
+
+        Returns
+        -------
+        str or None
+            ``None`` for no icon, the filename of the bundled icon it
+            was made from, or :data:`_CURRENT` if it matches none (or
+            the bundled icons are missing).
+
+        Notes
+        -----
+        See :func:`common._bundled_icon_name`.
+        """
+        if not current_icon:
+            return None
+        name = _bundled_icon_name(_VAULT_ICONS_DIR, current_icon)
+        if name is not None and name in self._pixmaps:
+            return name
+        return _CURRENT if vault_icon_pixmap(current_icon) is not None else None
 
     def _select_icon(self, name: str | None) -> None:
         """
@@ -254,42 +242,51 @@ class VaultIconDialog(QDialog):
             Bare icon filename, or ``None`` for "no icon".
         """
         self._selected_icon = name
-
-    def _update_color_preview(self) -> None:
-        """Paint the color swatch with the current color."""
-        self.color_preview.setStyleSheet(
-            f"background-color: {self._color.name()};"
-            "border: 1px solid #888888; border-radius: 4px;"
-        )
+        self._update_preview()
 
     def _choose_color(self) -> None:
-        """Ask for a new color, then refresh the swatch and the icons."""
+        """Ask for a new color, then refresh the swatch and the preview."""
         color = QColorDialog.getColor(
             self._color, self, translator.translate("vault_icon.color_button")
         )
         if not color.isValid():
             return
         self._color = color
-        self._update_color_preview()
-        self._retint_buttons()
+        self.color_swatch.set_color(color.name())
+        self._update_preview()
 
-    def _retint_buttons(self) -> None:
-        """Redraw every icon button with the current color."""
-        for name, pixmap in self._pixmaps.items():
-            self._buttons[name].setIcon(QIcon(tint_pixmap(pixmap, self._color)))
+    def _update_preview(self) -> None:
+        """Show the selected shape in the selected color, or "∅" for no icon."""
+        pixmap = self._pixmaps.get(self._selected_icon) if self._selected_icon else None
+        if pixmap is None:
+            self.preview.clear()
+            self.preview.setText("∅")
+            return
+        tinted = tint_pixmap(pixmap, self._color)
+        self.preview.setPixmap(
+            tinted.scaled(_PREVIEW_SIZE_PX, _PREVIEW_SIZE_PX, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
 
     def get_data(self) -> dict:
         """
-        Return the chosen icon filename and color.
+        Return the chosen icon and color.
 
         Returns
         -------
         dict
-            ``{"icon": str or None, "color": str or None}``: the bare
-            icon filename and the color as ``"#rrggbb"``. Both are
-            ``None`` when "None" is selected, since a color is
-            meaningless without an icon.
+            ``{"icon": str or None, "color": str or None}``: the icon
+            as a Base64 image (untinted) and the color as
+            ``"#rrggbb"``. Both are ``None`` when "None" is selected,
+            since a color is meaningless without an icon.
         """
-        if self._selected_icon is None:
+        name = self._selected_icon
+        if name is None:
             return {"icon": None, "color": None}
-        return {"icon": self._selected_icon, "color": self._color.name()}
+        if name == _CURRENT:
+            icon = self._current_icon
+        else:
+            path = _vault_icon_path(name)
+            icon = _file_to_base64(path) if path is not None else None
+        if icon is None:
+            return {"icon": None, "color": None}
+        return {"icon": icon, "color": self._color.name()}

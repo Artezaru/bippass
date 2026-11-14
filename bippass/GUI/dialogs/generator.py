@@ -19,7 +19,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
 
 from PyQt5.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -29,7 +28,6 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QPushButton,
     QSpinBox,
     QStackedWidget,
@@ -44,7 +42,9 @@ from ...core.password_generator import (
     generate_memorable_password,
     generate_random_password,
 )
+from ..clipboard import copy_secret
 from ..translate import LANGUAGE_NAME_KEYS, translator
+from ..widgets import mark_danger, show_error, small_button
 
 _LENGTH_RANGE = (1, 256)
 _DEFAULT_LENGTH = 20
@@ -132,8 +132,7 @@ class GeneratorDialog(QDialog):
         self.cancel_button = buttons.addButton(
             translator.translate("common.cancel"), QDialogButtonBox.RejectRole
         )
-        # Red through the `QPushButton#dangerButton` rule of `theme.py`.
-        self.cancel_button.setObjectName("dangerButton")
+        mark_danger(self.cancel_button)
         self.cancel_button.setAutoDefault(False)
         buttons.accepted.connect(self._on_use)
         buttons.rejected.connect(self.reject)
@@ -165,11 +164,8 @@ class GeneratorDialog(QDialog):
 
         self.special_check = QCheckBox(translator.translate("generator.special_characters_label"))
         self.special_characters_edit = QLineEdit(DEFAULT_SPECIAL_CHARACTERS)
-        self.special_reset_button = QPushButton("↺")
-        self.special_reset_button.setFixedWidth(28)
-        self.special_reset_button.setAutoDefault(False)
-        self.special_reset_button.setToolTip(
-            translator.translate("generator.special_characters_reset_tooltip")
+        self.special_reset_button = small_button(
+            "↺", "generator.special_characters_reset_tooltip", square=True
         )
         self.special_reset_button.clicked.connect(
             lambda: self.special_characters_edit.setText(DEFAULT_SPECIAL_CHARACTERS)
@@ -288,11 +284,7 @@ class GeneratorDialog(QDialog):
         try:
             password = self._generate()
         except (ValueError, OSError) as exc:
-            QMessageBox.critical(
-                self,
-                translator.translate("common.error_title"),
-                translator.translate("generator.generation_error", error=str(exc)),
-            )
+            show_error(self, "generator.generation_error", error=str(exc))
             return
         self._generated_password = password
         self.result_edit.setText(password)
@@ -307,9 +299,9 @@ class GeneratorDialog(QDialog):
         self.cancel_button.setVisible(has_password)
 
     def _on_copy(self) -> None:
-        """Copy the generated password to the clipboard."""
+        """Copy the generated password to the clipboard, erased from it after a delay."""
         if self._generated_password:
-            QApplication.clipboard().setText(self._generated_password)
+            copy_secret(self._generated_password)
 
     def _on_use(self) -> None:
         """Accept the dialog if a password was generated."""

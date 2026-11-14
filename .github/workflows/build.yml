@@ -31,24 +31,32 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install .
+          # [preview]: pypdfium2, renders the PDF pages in the preview
+          # ("Show source"). tqdm ([progress]) is useless in the GUI.
+          pip install ".[preview]"
           pip install pyinstaller
 
       - name: Build executable (Linux)
         if: runner.os == 'Linux'
         run: |
           pyinstaller --name bippass --windowed --onefile \
-            --add-data "bippass/resources:bippass/resources" \
-            --collect-all PyQt5 \
-            bippass/__main__.py
+            --add-data "watermark_pdf/resources:watermark_pdf/resources" \
+            --collect-submodules fontTools.ttLib.tables \
+            --collect-all pypdfium2 \
+            --collect-all pypdfium2_raw \
+            --icon watermark_pdf/resources/app.png \
+            watermark_pdf/__main__.py
 
       - name: Build executable (Windows)
         if: runner.os == 'Windows'
         run: |
           pyinstaller --name bippass --windowed --onefile `
-            --add-data "bippass/resources;bippass/resources" `
-            --collect-all PyQt5 `
-            bippass/__main__.py
+            --add-data "watermark_pdf/resources;watermark_pdf/resources" `
+            --collect-submodules fontTools.ttLib.tables `
+            --collect-all pypdfium2 `
+            --collect-all pypdfium2_raw `
+            --icon watermark_pdf/resources/app.png `
+            watermark_pdf/__main__.py
 
       - name: Package artifact (Linux)
         if: runner.os == 'Linux'
@@ -68,9 +76,7 @@ jobs:
       - name: Build .deb package (Linux)
         if: runner.os == 'Linux'
         run: |
-          # Strip the leading "v" from the tag (e.g. "v1.0.0" -> "1.0.0"),
-          # or fall back to "0.0.0" when not triggered by a tag (manual
-          # workflow_dispatch run) -- dpkg requires a Version field.
+          # "v1.0.0" -> "1.0.0"; "0.0.0" for a manual run (dpkg needs a version).
           VERSION="${GITHUB_REF_NAME#v}"
           if [ "${{ github.ref_type }}" != "tag" ]; then
             VERSION="0.0.0"
@@ -85,8 +91,12 @@ jobs:
           cp "dist/${{ matrix.asset_name }}" "$PKGROOT/usr/bin/bippass"
           chmod 755 "$PKGROOT/usr/bin/bippass"
 
-          # Bundled fallback icon, reused as the app's launcher icon.
-          cp bippass/resources/app.png "$PKGROOT/usr/share/pixmaps/bippass.png"
+          # Launcher icon (optional: skipped if the file does not exist).
+          ICON_LINE=""
+          if [ -f bippass/resources/app.png ]; then
+            cp bippass/resources/app.png "$PKGROOT/usr/share/pixmaps/bippass.png"
+            ICON_LINE="Icon=bippass"
+          fi
 
           cat > "$PKGROOT/DEBIAN/control" <<EOF
           Package: bippass
@@ -94,19 +104,23 @@ jobs:
           Section: utils
           Priority: optional
           Architecture: amd64
+          Depends: libgl1, libxkbcommon-x11-0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-randr0, libxcb-render-util0, libxcb-shape0, libxcb-xinerama0, libxcb-xkb1
           Maintainer: Artezaru <artezaru.github@proton.me>
-          Description: Local python password manager based on Artezaru/pyaescbc.
+          Description: Add a repeated text watermark to PDF files.
+           Desktop application (PyQt5) to watermark PDF files or a whole
+           folder, with a live preview.
           EOF
 
-          cat > "$PKGROOT/usr/share/applications/bippass.desktop" <<EOF
+          cat > "$PKGROOT/usr/share/applications/watermark-pdf.desktop" <<EOF
           [Desktop Entry]
           Type=Application
-          Name=bippass
-          Comment=Local python password manager
-          Exec=/usr/bin/bippass
-          Icon=bippass
+          Name=Bippass
+          Comment=Add a text watermark to PDF files
+          Exec=/usr/bin/bippass %F
+          $ICON_LINE
           Terminal=false
-          Categories=Utility;Security;
+          MimeType=application/pdf;
+          Categories=Office;Utility;
           EOF
 
           dpkg-deb --build --root-owner-group "$PKGROOT" "dist/bippass_${VERSION}_amd64.deb"

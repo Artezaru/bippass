@@ -1,0 +1,38 @@
+{
+    "en.txt": {
+        "name": "EFF Large Wordlist for Passphrases",
+        "author": "Joseph Bonneau, Electronic Frontier Foundation",
+        "year": 2016,
+        "source": "https://www.eff.org/files/2016/07/18/eff_large_wordlist.txt",
+        "homepage": "https://www.eff.org/dice",
+        "license": "CC-BY-3.0-US",
+        "license_url": "https://creativecommons.org/licenses/by/3.0/us/",
+        "format": "dice-indexed (5 dice, tab separated), 7776 words",
+        "modified": false,
+        "note": "License as published with the list in 2016 (also recorded by ulif/diceware). EFF's current copyright page (https://www.eff.org/copyright) names CC BY 4.0 for its original material."
+    },
+    "fr.txt": {
+        "name": "French diceware wordlist (Tails / Tor Project)",
+        "author": "Tango <tango.tails@proton.me>",
+        "year": 2024,
+        "source": "https://github.com/ulif/diceware/blob/master/diceware/wordlists/wordlist_fr.txt",
+        "homepage": "https://github.com/ulif/diceware",
+        "license": "CC0-1.0",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "format": "dice-indexed (5 dice, space separated), 7776 words",
+        "modified": false,
+        "note": null
+    },
+    "es.txt": {
+        "name": "Spanish diceware wordlist",
+        "author": "victordargallo (@jawlenskys) <victordargallo@disroot.org>",
+        "year": 2024,
+        "source": "https://github.com/ulif/diceware/blob/master/diceware/wordlists/wordlist_es.txt",
+        "homepage": "https://github.com/ulif/diceware",
+        "license": "CC-BY-4.0",
+        "license_url": "https://creativecommons.org/licenses/by/4.0/",
+        "format": "plain (one word per line), 8192 words",
+        "modified": false,
+        "note": "Built from the Debian Spanish dictionary and the most used words of the Corpus de Referencia del Espanol Actual (CREA)."
+    }
+}

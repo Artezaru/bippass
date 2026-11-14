@@ -18,205 +18,244 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
-import pyaescbc
+from typing import NoReturn, SupportsIndex
+
+from .datakey import DataKey
 
 
 class Credentials:
     """
-    Hold the primary and secondary encryption credentials.
+    Hold the two keys of an unlocked password manager.
 
-    A :class:`PasswordManager` needs two independent passwords: the
-    *primary* password, used to encrypt and decrypt the whole manager
-    bundle, and the *secondary* password, used to encrypt and decrypt
-    individual sensitive item fields (passwords, TOTP secrets,
-    encrypted custom fields). This class stores both, alongside the
-    fixed iteration count that goes with each (see
-    :attr:`PRIMARY_ITERATIONS`/:attr:`SECONDARY_ITERATIONS`).
+    A :class:`PasswordManager` is protected by two independent
+    passwords, each of which wraps a random :class:`DataKey`:
+
+    - the **primary** password wraps the **file key**, which encrypts
+      the whole content of the file (vaults, items, metadata);
+    - the **secondary** password wraps the **data key**, which encrypts
+      every sensitive value (passwords, TOTP secrets, encrypted custom
+      fields) inside that content.
+
+    This class holds the two *keys*, never the passwords: a password is
+    only needed for the time it takes to unwrap (or wrap) its key, and
+    is erased right after (see :meth:`DataKey.unwrap`).
 
     Notes
     -----
-    There is no PIN anymore, and no per-password iteration count
-    derived from one: every primary password is encrypted with
-    :attr:`PRIMARY_ITERATIONS` iterations, and every secondary
-    password with :attr:`SECONDARY_ITERATIONS`, full stop. This
-    reflects pyaescbc's own current API, which dropped PIN-derived
-    iteration counts in favor of the caller simply choosing a fixed
-    one.
+    **Layers.** Each key is set independently, as each layer is
+    unlocked (see :meth:`PasswordManager.unlock` and
+    :meth:`PasswordManager.decrypt`). Reading a key whose layer
+    is still locked raises :class:`RuntimeError`.
 
-    Passwords are stored by reference, never copied: the caller
-    retains control over the lifetime of the underlying bytearrays.
+    **Iterations.** Both passwords use the same, fixed number of PBKDF2
+    iterations (:attr:`PRIMARY_ITERATIONS`, :attr:`SECONDARY_ITERATIONS`).
+    Since a password is only derived when its layer is unlocked or its
+    password changed, never per value nor per save, a high count costs
+    the user a few seconds per session at most, while multiplying the
+    cost of every guess for an attacker.
 
-    This class performs no locking of its own. Callers that need
-    thread-safety (such as :class:`PasswordManager`) are responsible
-    for synchronizing access to a shared instance.
+    **Ownership.** The keys are owned by this instance: setting a new
+    key clears the previous one (unless it is the same object), and
+    :meth:`clear` clears both. Copying and pickling are refused, for
+    the same reason as for :class:`DataKey`.
+
+    This class performs no locking of its own.
 
     See Also
     --------
+    DataKey
+        The keys held by this class.
+
     PasswordManager
-        Uses one :class:`Credentials` instance to hold both its
-        primary and secondary passwords.
+        Owns one :class:`Credentials` instance for its whole session.
     """
 
-    #: Fixed iteration count for the primary password.
-    PRIMARY_ITERATIONS = 5_000_000
+    __slots__ = ("_file_key", "_data_key")
 
-    #: Fixed iteration count for the secondary password.
-    SECONDARY_ITERATIONS = 500_000
+    #: PBKDF2 iterations used to wrap the file key with the primary password.
+    PRIMARY_ITERATIONS: int = 5_000_000
+
+    #: PBKDF2 iterations used to wrap the data key with the secondary password.
+    SECONDARY_ITERATIONS: int = 5_000_000
 
     def __init__(self) -> None:
         """
-        Create an empty credentials holder.
-
-        Neither the primary nor the secondary password is set yet:
-        call :meth:`set_primary_password` and
-        :meth:`set_secondary_password` before using any of the
-        getters.
+        Create an empty credentials holder: both layers are locked.
         """
-        self._primary_password: bytearray | None = None
-        self._secondary_password: bytearray | None = None
+        self._file_key: DataKey | None = None
+        self._data_key: DataKey | None = None
 
     # ----------------
-    # Primary
+    # File key (primary layer)
     # ----------------
 
-    def set_primary_password(self, password: bytearray) -> None:
+    @property
+    def file_key(self) -> DataKey:
         """
-        Set the primary password.
+        Return the file key.
+
+        Returns
+        -------
+        DataKey
+            The key encrypting the file content, by reference.
+
+        Raises
+        ------
+        RuntimeError
+            If the primary layer is locked (no file key set, or
+            :meth:`clear` has been called).
+        """
+        if self._file_key is None:
+            raise RuntimeError("The primary layer is locked: no file key.")
+        return self._file_key
+
+    @property
+    def has_file_key(self) -> bool:
+        """Whether the primary layer is unlocked."""
+        return self._file_key is not None
+
+    def set_file_key(self, key: DataKey) -> None:
+        """
+        Set the file key.
 
         Parameters
         ----------
-        password : bytearray
-            Primary password, stored by reference.
+        key : DataKey
+            New file key, stored by reference: this instance takes
+            ownership of it.
 
         Raises
         ------
         TypeError
-            If ``password`` is not a :class:`bytearray`.
+            If ``key`` is not a :class:`DataKey`.
 
         Notes
         -----
-        If a primary password was already set, the previous one is
-        wiped from memory before being replaced, so this method also
-        doubles as "change the primary password".
+        The previous file key, if any (and if it is not ``key``
+        itself), is cleared.
         """
-        if not isinstance(password, bytearray):
-            raise TypeError(f"password must be bytearray, not {type(password)}")
+        if not isinstance(key, DataKey):
+            raise TypeError(f"key must be DataKey, not {type(key)}")
+        if self._file_key is not None and self._file_key is not key:
+            self._file_key.clear()
+        self._file_key = key
 
-        if self._primary_password is not None:
-            pyaescbc.delete_bytearray(self._primary_password)
+    # ----------------
+    # Data key (secondary layer)
+    # ----------------
 
-        self._primary_password = password
-
-    def get_primary_password(self) -> bytearray:
+    @property
+    def data_key(self) -> DataKey:
         """
-        Return the primary password.
+        Return the data key.
 
         Returns
         -------
-        bytearray
-            The primary password, by reference (not a copy).
+        DataKey
+            The key encrypting every sensitive value, by reference.
+            This is the object to pass to every encrypted-field
+            operation of :class:`Item`.
 
         Raises
         ------
-        ValueError
-            If :meth:`set_primary_password` has not been called yet,
-            or :meth:`clear` has since been called.
+        RuntimeError
+            If the secondary layer is locked (no data key set, or
+            :meth:`clear` has been called).
         """
-        if self._primary_password is None:
-            raise ValueError("Primary credentials have not been set yet.")
-        return self._primary_password
+        if self._data_key is None:
+            raise RuntimeError("The secondary layer is locked: no data key.")
+        return self._data_key
 
-    def get_primary_iterations(self) -> int:
+    @property
+    def has_data_key(self) -> bool:
+        """Whether the secondary layer is unlocked."""
+        return self._data_key is not None
+
+    def set_data_key(self, key: DataKey) -> None:
         """
-        Return the primary iteration count.
-
-        Returns
-        -------
-        int
-            Always :attr:`PRIMARY_ITERATIONS`.
-        """
-        return self.PRIMARY_ITERATIONS
-
-    # ----------------
-    # Secondary
-    # ----------------
-
-    def set_secondary_password(self, password: bytearray) -> None:
-        """
-        Set the secondary password.
+        Set the data key.
 
         Parameters
         ----------
-        password : bytearray
-            Secondary password, stored by reference.
+        key : DataKey
+            New data key, stored by reference: this instance takes
+            ownership of it.
 
         Raises
         ------
         TypeError
-            If ``password`` is not a :class:`bytearray`.
+            If ``key`` is not a :class:`DataKey`.
 
         Notes
         -----
-        If a secondary password was already set, the previous one is
-        wiped from memory before being replaced, so this method also
-        doubles as "change the secondary password".
+        The previous data key, if any (and if it is not ``key``
+        itself), is cleared.
         """
-        if not isinstance(password, bytearray):
-            raise TypeError(f"password must be bytearray, not {type(password)}")
-
-        if self._secondary_password is not None:
-            pyaescbc.delete_bytearray(self._secondary_password)
-
-        self._secondary_password = password
-
-    def get_secondary_password(self) -> bytearray:
-        """
-        Return the secondary password.
-
-        Returns
-        -------
-        bytearray
-            The secondary password, by reference (not a copy).
-
-        Raises
-        ------
-        ValueError
-            If :meth:`set_secondary_password` has not been called
-            yet, or :meth:`clear` has since been called.
-        """
-        if self._secondary_password is None:
-            raise ValueError("Secondary credentials have not been set yet.")
-        return self._secondary_password
-
-    def get_secondary_iterations(self) -> int:
-        """
-        Return the secondary iteration count.
-
-        Returns
-        -------
-        int
-            Always :attr:`SECONDARY_ITERATIONS`.
-        """
-        return self.SECONDARY_ITERATIONS
+        if not isinstance(key, DataKey):
+            raise TypeError(f"key must be DataKey, not {type(key)}")
+        if self._data_key is not None and self._data_key is not key:
+            self._data_key.clear()
+        self._data_key = key
 
     # ----------------
     # Cleanup
     # ----------------
 
-    def clear(self) -> None:
+    def clear_data_key(self) -> None:
         """
-        Erase both the primary and secondary passwords from memory.
+        Erase the data key only: lock the secondary layer again.
 
         Notes
         -----
-        Irreversible. Every getter raises :class:`ValueError` after
-        this call: the underlying bytearrays are zeroed in place and
-        then dropped.
+        The file key is kept. Calling it when the secondary layer is
+        already locked is harmless.
         """
-        if self._primary_password is not None:
-            pyaescbc.delete_bytearray(self._primary_password)
-        if self._secondary_password is not None:
-            pyaescbc.delete_bytearray(self._secondary_password)
+        if self._data_key is not None:
+            self._data_key.clear()
+        self._data_key = None
 
-        self._primary_password = None
-        self._secondary_password = None
+    def clear(self) -> None:
+        """
+        Erase both keys from memory.
+
+        Notes
+        -----
+        Irreversible: both layers are locked again, and every key
+        property raises :class:`RuntimeError` afterwards. Calling it
+        more than once is harmless.
+        """
+        for key in (self._file_key, self._data_key):
+            if key is not None:
+                key.clear()
+        self._file_key = None
+        self._data_key = None
+
+    # ----------------
+    # Copy protection
+    # ----------------
+
+    def __copy__(self) -> NoReturn:
+        """Refuse shallow copies (see the class-level Notes)."""
+        raise TypeError(f"{type(self).__name__} must not be copied.")
+
+    def __deepcopy__(self, memo: dict) -> NoReturn:
+        """Refuse deep copies (see the class-level Notes)."""
+        raise TypeError(f"{type(self).__name__} must not be copied.")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        """Refuse pickling (see the class-level Notes)."""
+        raise TypeError(f"{type(self).__name__} must not be pickled.")
+
+    def __repr__(self) -> str:
+        """
+        Return a debug-friendly representation.
+
+        Returns
+        -------
+        str
+            Only which layers are unlocked, never any key.
+        """
+        return (
+            f"{type(self).__name__}(primary={'unlocked' if self.has_file_key else 'locked'}, "
+            f"secondary={'unlocked' if self.has_data_key else 'locked'})"
+        )

@@ -32,58 +32,19 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
-    QPushButton,
     QVBoxLayout,
 )
 
-from ...core.credentials import Credentials
+from ...core.profiles import PROFILE_EXTENSION
+from ..common import item_display_name, vault_display_name
 from ..translate import translator
-from ..widgets import PasswordField, ok_cancel_buttons
+from ..widgets import NewPasswordFields, PasswordField, ok_cancel_buttons, small_button, warn
 
 if TYPE_CHECKING:
     from ...core.manager import PasswordManager
 
 
-_DEFAULT_EXPORT_FILENAME = "export.encrypted"
-
-
-def _build_credentials(primary: PasswordField, secondary: PasswordField) -> Credentials:
-    """
-    Build fresh credentials from two password fields.
-
-    Parameters
-    ----------
-    primary : PasswordField
-        Field holding the primary password.
-    secondary : PasswordField
-        Field holding the secondary password.
-
-    Returns
-    -------
-    Credentials
-        New credentials holding both passwords.
-    """
-    credentials = Credentials()
-    credentials.set_primary_password(primary.to_bytearray())
-    credentials.set_secondary_password(secondary.to_bytearray())
-    return credentials
-
-
-def _warn(parent: QDialog, message_key: str) -> None:
-    """
-    Show a translated validation warning.
-
-    Parameters
-    ----------
-    parent : QDialog
-        Dialog the message box is attached to.
-    message_key : str
-        Translation key of the message.
-    """
-    QMessageBox.warning(
-        parent, translator.translate("common.error_title"), translator.translate(message_key)
-    )
+_DEFAULT_EXPORT_FILENAME = f"export{PROFILE_EXTENSION}"
 
 
 def _path_row(edit: QLineEdit, on_browse: Callable[[], None]) -> QHBoxLayout:
@@ -102,8 +63,7 @@ def _path_row(edit: QLineEdit, on_browse: Callable[[], None]) -> QHBoxLayout:
     QHBoxLayout
         The row, to be added to the dialog's layout.
     """
-    browse_button = QPushButton(translator.translate("common.browse"))
-    browse_button.setAutoDefault(False)
+    browse_button = small_button(translator.translate("common.browse"))
     browse_button.clicked.connect(on_browse)
     row = QHBoxLayout()
     row.addWidget(edit, stretch=1)
@@ -117,73 +77,70 @@ def _path_row(edit: QLineEdit, on_browse: Callable[[], None]) -> QHBoxLayout:
 
 class ExportItemsDialog(QDialog):
     """
-    Dialog to export a selection of items to a new, standalone vault
-    file, encrypted with its own, freshly entered credentials.
+    Dialog to export a selection of items to a new, standalone profile
+    file, protected by two freshly chosen passwords.
 
     Parameters
     ----------
     manager : PasswordManager
-        Manager whose vaults and items are listed for selection.
+        Unlocked manager whose items are listed for selection.
     parent : QWidget, optional
         Parent widget.
 
     Notes
     -----
-    The items are read once, at construction time; the dialog does not
-    refresh them while it is open.
+    The items are read once, at construction time. The passwords are
+    meant to be shared with the recipient: they are not this profile's
+    own.
     """
 
     def __init__(self, manager: PasswordManager, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(translator.translate("export.dialog_title"))
-        self.resize(480, 520)
-
+        tr = translator.translate
+        self.setWindowTitle(tr("export.dialog_title"))
+        self.resize(480, 560)
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel(translator.translate("export.items_label")))
+        layout.addWidget(QLabel(tr("export.items_label")))
         self.items_list = QListWidget()
         for vault in manager.get_vaults():
-            for item in vault.get_items():
-                item_name = item.get("item_name") or translator.translate("common.unnamed_item")
-                entry = QListWidgetItem(f"{vault.name} / {item_name}")
+            for item in vault.sorted_items():
+                entry = QListWidgetItem(f"{vault_display_name(vault)} / {item_display_name(item)}")
                 entry.setFlags(entry.flags() | Qt.ItemIsUserCheckable)
                 entry.setCheckState(Qt.Unchecked)
-                entry.setData(Qt.UserRole, (item.uuid, vault.name))
+                entry.setData(Qt.UserRole, item.uuid)
                 self.items_list.addItem(entry)
         layout.addWidget(self.items_list, stretch=1)
 
-        self.primary_field = PasswordField()
-        self.confirm_primary_field = PasswordField()
-        self.secondary_field = PasswordField()
-        self.confirm_secondary_field = PasswordField()
-
         form = QFormLayout()
-        form.addRow(translator.translate("export.primary_password_label"), self.primary_field)
-        form.addRow(
-            translator.translate("export.confirm_primary_password_label"),
-            self.confirm_primary_field,
+        self.vault_name_edit = QLineEdit(tr("export.default_vault_name"))
+        form.addRow(tr("export.vault_name_label"), self.vault_name_edit)
+        self.primary_fields = NewPasswordFields(
+            form, tr("export.primary_password_label"), tr("export.confirm_primary_password_label")
         )
-        form.addRow(translator.translate("export.secondary_password_label"), self.secondary_field)
-        form.addRow(
-            translator.translate("export.confirm_secondary_password_label"),
-            self.confirm_secondary_field,
+        self.secondary_fields = NewPasswordFields(
+            form, tr("export.secondary_password_label"), tr("export.confirm_secondary_password_label")
         )
         layout.addLayout(form)
 
         self.destination_edit = QLineEdit()
-        self.destination_edit.setPlaceholderText(translator.translate("export.destination_label"))
+        self.destination_edit.setPlaceholderText(tr("export.destination_label"))
         layout.addLayout(_path_row(self.destination_edit, self._browse_destination))
-
         layout.addWidget(ok_cancel_buttons(self, self._on_accept))
 
-    def _checked_items(self) -> list[tuple[str, str]]:
+    def _clear(self) -> None:
+        """Erase every typed password."""
+        self.primary_fields.clear()
+        self.secondary_fields.clear()
+
+    def _checked_uuids(self) -> list[str]:
         """
         Return the items checked for export.
 
         Returns
         -------
-        list of (str, str)
-            ``(item_uuid, vault_name)`` of every checked row.
+        list of str
+            UUIDs of every checked row, in list order.
         """
         return [
             self.items_list.item(row).data(Qt.UserRole)
@@ -198,43 +155,53 @@ class ExportItemsDialog(QDialog):
             self,
             translator.translate("export.select_file_title"),
             start,
-            translator.translate("common.vault_files_filter"),
+            translator.translate("common.profile_files_filter"),
         )
         if path:
+            if not Path(path).suffix:
+                path += PROFILE_EXTENSION
             self.destination_edit.setText(path)
 
     def _on_accept(self) -> None:
         """Accept the dialog if every field is valid, warn otherwise."""
-        if not self._checked_items():
-            _warn(self, "export.no_items_selected")
-        elif not self.primary_field.text() or not self.secondary_field.text():
-            _warn(self, "export.missing_password")
-        elif (
-            self.primary_field.text() != self.confirm_primary_field.text()
-            or self.secondary_field.text() != self.confirm_secondary_field.text()
-        ):
-            _warn(self, "export.password_mismatch")
+        problems = {self.primary_fields.problem(), self.secondary_fields.problem()}
+        if not self._checked_uuids():
+            warn(self, "export.no_items_selected")
+        elif "empty" in problems:
+            warn(self, "export.missing_password")
+        elif "mismatch" in problems:
+            warn(self, "export.password_mismatch")
         elif not self.destination_edit.text().strip():
-            _warn(self, "export.missing_destination")
+            warn(self, "export.missing_destination")
         else:
             self.accept()
 
+    def reject(self) -> None:
+        """Erase the typed passwords, then close."""
+        self._clear()
+        super().reject()
+
     def get_data(self) -> dict:
         """
-        Return the selected items, the export credentials and the
-        destination path.
+        Return the export settings, then erase the password fields.
 
         Returns
         -------
         dict
-            ``{"items": list[(item_uuid, vault_name)], "credentials":
-            Credentials, "path": str}``.
+            ``{"item_uuids": list[str], "vault_name": str or None,
+            "primary": bytearray, "secondary": bytearray, "path": str}``.
+            The caller owns both password buffers; passing them to
+            :meth:`PasswordManager.export_items` erases them.
         """
-        return {
-            "items": self._checked_items(),
-            "credentials": _build_credentials(self.primary_field, self.secondary_field),
+        data = {
+            "item_uuids": self._checked_uuids(),
+            "vault_name": self.vault_name_edit.text().strip() or None,
+            "primary": self.primary_fields.to_bytearray(),
+            "secondary": self.secondary_fields.to_bytearray(),
             "path": self.destination_edit.text().strip(),
         }
+        self._clear()
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -243,42 +210,40 @@ class ExportItemsDialog(QDialog):
 
 class ImportItemsDialog(QDialog):
     """
-    Dialog to import the items of a standalone vault file (as written
-    by :class:`ExportItemsDialog`) into the manager.
+    Dialog to import every item of another profile file (typically
+    written by :class:`ExportItemsDialog`) into a vault of the manager.
 
     Parameters
     ----------
     manager : PasswordManager
-        Manager the items will be imported into; only used to list its
-        vault names in :attr:`vault_combo`.
+        Unlocked manager receiving the items; its vaults are listed as
+        possible targets, after the default "new vault" entry.
     parent : QWidget, optional
         Parent widget.
     """
 
     def __init__(self, manager: PasswordManager, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(translator.translate("import.dialog_title"))
-
+        tr = translator.translate
+        self.setWindowTitle(tr("import.dialog_title"))
         layout = QFormLayout(self)
 
         self.file_edit = QLineEdit()
-        layout.addRow(
-            translator.translate("import.file_label"),
-            _path_row(self.file_edit, self._browse_file),
-        )
+        layout.addRow(tr("import.file_label"), _path_row(self.file_edit, self._browse_file))
 
         self.primary_field = PasswordField()
         self.secondary_field = PasswordField()
-        layout.addRow(translator.translate("import.primary_password_label"), self.primary_field)
-        layout.addRow(translator.translate("import.secondary_password_label"), self.secondary_field)
+        layout.addRow(tr("import.primary_password_label"), self.primary_field)
+        layout.addRow(tr("import.secondary_password_label"), self.secondary_field)
 
-        # Editable, so a new vault can be named.
+        # Several vaults may share a name: each entry carries its UUID.
         self.vault_combo = QComboBox()
-        self.vault_combo.setEditable(True)
-        self.vault_combo.addItems([vault.name for vault in manager.get_vaults()])
-        self.vault_combo.setEditText(translator.translate("import.default_vault_name"))
-        layout.addRow(translator.translate("import.vault_label"), self.vault_combo)
-
+        self.vault_combo.addItem(
+            tr("import.new_vault_entry", name=tr("import.new_vault_name")), None
+        )
+        for vault in manager.get_vaults():
+            self.vault_combo.addItem(vault_display_name(vault), vault.uuid)
+        layout.addRow(tr("import.vault_label"), self.vault_combo)
         layout.addRow(ok_cancel_buttons(self, self._on_accept))
 
     def _browse_file(self) -> None:
@@ -288,7 +253,7 @@ class ImportItemsDialog(QDialog):
             self,
             translator.translate("import.select_file_title"),
             start,
-            translator.translate("common.vault_files_filter"),
+            translator.translate("common.profile_files_filter"),
         )
         if path:
             self.file_edit.setText(path)
@@ -296,25 +261,37 @@ class ImportItemsDialog(QDialog):
     def _on_accept(self) -> None:
         """Accept the dialog if every field is filled, warn otherwise."""
         if not self.file_edit.text().strip():
-            _warn(self, "import.missing_file")
+            warn(self, "import.missing_file")
         elif not self.primary_field.text() or not self.secondary_field.text():
-            _warn(self, "import.missing_password")
-        elif not self.vault_combo.currentText().strip():
-            _warn(self, "import.missing_vault")
+            warn(self, "import.missing_password")
         else:
             self.accept()
 
+    def reject(self) -> None:
+        """Erase the typed passwords, then close."""
+        self.primary_field.clear()
+        self.secondary_field.clear()
+        super().reject()
+
     def get_data(self) -> dict:
         """
-        Return the file to import, its credentials and the target vault.
+        Return the file to import, its passwords and the target vault,
+        then erase the password fields.
 
         Returns
         -------
         dict
-            ``{"path": str, "credentials": Credentials, "vault": str}``.
+            ``{"path": str, "primary": bytearray, "secondary": bytearray,
+            "vault_uuid": str or None}``, ``None`` meaning a new vault.
+            The caller owns both password buffers; passing them to
+            :meth:`PasswordManager.import_items` erases them.
         """
-        return {
+        data = {
             "path": self.file_edit.text().strip(),
-            "credentials": _build_credentials(self.primary_field, self.secondary_field),
-            "vault": self.vault_combo.currentText().strip(),
+            "primary": self.primary_field.to_bytearray(),
+            "secondary": self.secondary_field.to_bytearray(),
+            "vault_uuid": self.vault_combo.currentData(),
         }
+        self.primary_field.clear()
+        self.secondary_field.clear()
+        return data

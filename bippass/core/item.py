@@ -18,172 +18,253 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
-import base64
-import binascii
-import datetime
-import copy
-
-from enum import Enum, auto
-from typing import Literal, Sequence, cast, Tuple, TypeAlias
-from .types import ItemData, ClearString, CryptedBase64String, ClearSecretBytes, ClearStringList, ClearSecretBytesList, CryptedBase64StringList, ItemKind
-from .exceptions import SecondaryPasswordError, CorruptedBase64Error, CorruptedUtf8Error
-from .credentials import Credentials
+from contextlib import contextmanager
+from dataclasses import dataclass, field as dataclass_field
+from enum import Enum
+from typing import Any, Callable, Iterator, Literal, cast, overload
 
 import pyaescbc
 
+from .types import (
+    ItemData, ItemField, ClearField, SecretField, ItemFieldsData, CustomFieldData, CustomKind, ClearString,
+    ClearStringList, ClearSecretBytesList,
+)
+from .datakey import DataKey
+from .encrypted_value import EncryptedValue
+from .common import (
+    _now, _check_keys, _check_optional_str, _check_optional_name, _check_name,
+    _check_date, _check_index, _check_clear_list, _check_secret_list,
+)
+from .uuids import _check_uuid, _check_unique_uuids, _generate_uuid, _get_uuid_index
 
-ItemField: TypeAlias = Literal[
-    "item_name", "icon", "item_date",
-    "logins", "websites", "phones", "emails",
-    "passwords", "totps",
-]
 
 class FieldKind(Enum):
-    SCALAR = auto()
-    ENCRYPTED = auto()
-    SCALAR_LIST = auto()
-    ENCRYPTED_LIST = auto()
+    """
+    Storage kind of an item field (predefined or custom).
 
-_FIELDS: dict[str, FieldKind] = {
-    "item_name": FieldKind.SCALAR,
-    "item_date": FieldKind.SCALAR,
-    "icon":      FieldKind.SCALAR,
-    "logins":    FieldKind.SCALAR_LIST,
-    "websites":  FieldKind.SCALAR_LIST,
-    "phones":    FieldKind.SCALAR_LIST,
-    "emails":    FieldKind.SCALAR_LIST,
-    "passwords": FieldKind.ENCRYPTED_LIST,
-    "totps":     FieldKind.ENCRYPTED_LIST,
+    Every field holds a list of values; the kind only says whether
+    those values are stored in clear or encrypted. The value of each
+    member is its name in the serialized data (see :data:`CustomKind`).
+    """
+
+    CLEAR = "clear"
+    ENCRYPTED = "encrypted"
+
+
+#: Kind of every predefined field, in serialization order.
+_FIELDS: dict[ItemField, FieldKind] = {
+    "logins":    FieldKind.CLEAR,
+    "websites":  FieldKind.CLEAR,
+    "emails":    FieldKind.CLEAR,
+    "phones":    FieldKind.CLEAR,
+    "passwords": FieldKind.ENCRYPTED,
+    "totps":     FieldKind.ENCRYPTED,
 }
 
-_CUSTOM_KINDS: dict[str, FieldKind] = {
-    "SCALAR":         FieldKind.SCALAR,
-    "ENCRYPTED":      FieldKind.ENCRYPTED,
-    "SCALAR LIST":    FieldKind.SCALAR_LIST,
-    "ENCRYPTED LIST": FieldKind.ENCRYPTED_LIST,
-}
+#: Keys accepted in each section of the serialized data.
+_TOP_KEYS = ("metadata", "fields", "customs", "gui")
+_METADATA_KEYS = ("uuid", "name", "creation_date", "modification_date")
+_CUSTOM_KEYS = ("id", "name", "kind", "values")
+_GUI_KEYS = ("icon", "color")
+
+#: Domain label prefixed to every context (see :meth:`Item._context`).
+#: NEVER change it: existing values could no longer be decrypted.
+_CONTEXT_LABEL = "bippass::item::v3"
+
+
+def _to_kind(kind: FieldKind | CustomKind) -> FieldKind:
+    """
+    Normalize a kind given as a :class:`FieldKind` or as its serialized name.
+
+    Raises
+    ------
+    ValueError
+        If ``kind`` is not a known kind.
+    """
+    if isinstance(kind, FieldKind):
+        return kind
+    try:
+        return FieldKind(kind)
+    except ValueError:
+        raise ValueError(
+            f"{kind!r} is not a known field kind, expected one of "
+            f"{tuple(k.value for k in FieldKind)}"
+        ) from None
+
+
+@dataclass(slots=True)
+class _CustomField:
+    """
+    A custom field of an item (internal).
+
+    Attributes
+    ----------
+    id : str
+        UUID of the field, unique within its item. Part of the context
+        of its encrypted values: it never changes.
+
+    name : str
+        Display name, chosen by the user. Not necessarily unique.
+
+    kind : FieldKind
+        Whether :attr:`values` are clear or encrypted.
+
+    values : list of str or list of EncryptedValue
+        The values of the field.
+    """
+
+    id: str
+    name: str
+    kind: FieldKind
+    values: list = dataclass_field(default_factory=list)
 
 
 class Item:
     """
     Represent a single password vault item.
 
-    An item contains both unencrypted and encrypted information. Metadata
-    such as the item name, icon, logins, websites, phone numbers, and email
-    addresses are stored directly in the item data. Sensitive values such
-    as passwords and TOTP secrets are stored as Base64-encoded encrypted
-    values.
-
-    The :class:`Item` class is responsible for managing its own data and
-    performing encryption or decryption of sensitive fields. The caller
-    must provide a :class:`Credentials` instance holding the secondary
-    password and iteration count when accessing encrypted values.
+    An item contains both unencrypted and encrypted information. Its
+    name, logins, websites, phone numbers, email addresses and display
+    settings are stored in clear (they are only protected by the
+    primary password, which encrypts the whole file). Sensitive values
+    such as passwords and TOTP secrets are stored as
+    :class:`EncryptedValue` instances, sealed with the :class:`DataKey`.
 
     Parameters
     ----------
     item_uuid : str
-        Globally unique identifier of the item.
+        Globally unique identifier of the item, in canonical form (see
+        :func:`_is_uuid`).
 
-    data : ItemData
-        Serialized item data.
+    Raises
+    ------
+    UUIDError
+        If ``item_uuid`` is not a UUID in canonical form.
 
     Notes
     -----
-    The ``data`` dictionary is kept by reference and modified directly
-    when the item is updated. No copy of the dictionary is created.
+    **Structure.** An item is made of four parts, mirrored by its
+    serialized form (see :meth:`to_dict`)::
 
-    Encrypted fields use the following representation::
+        {
+            "metadata": {"uuid", "name", "creation_date", "modification_date"},
+            "fields":   {"logins", "websites", "emails", "phones",
+                         "passwords", "totps"},
+            "customs":  [{"id", "name", "kind", "values"}, ...],
+            "gui":      {"icon", "color"},
+        }
 
-        bytearray
-            ↓ pyaescbc.encrypt()
-        bytearray
-            ↓ base64.b64encode()
-        str
+    - ``metadata`` identifies the item. The UUID is stored here, and
+      only here: the item is the single source of truth for its UUID.
+    - ``fields`` holds the predefined fields. Every field is a list of
+      values; ``passwords`` and ``totps`` are encrypted, the others are
+      clear. An unset field is an empty list.
+    - ``customs`` holds the user-defined fields, in display order. Each
+      one is identified by its own UUID (``id``), so that several
+      custom fields may share the same name, and renaming one never
+      requires re-encryption. Each one is either ``"clear"`` or
+      ``"encrypted"``, and holds a list of values.
+    - ``gui`` holds what is only useful to the graphical interface.
 
-    Decryption performs the inverse operations.
+    **Format evolution.** Reading is strict about *unknown* keys and
+    lenient about *missing* ones (see :meth:`from_dict`): data written
+    by an older version (missing keys) can be read by a newer one, but
+    data written by a newer version (unknown keys) is refused by an
+    older one, instead of being silently truncated when saved back.
 
-    Every encrypted-field operation takes a :class:`Credentials`
-    instance rather than a bare ``password``/``iterations`` pair.
-    ``Credentials`` is meant to be a single object shared across every
-    item of a :class:`PasswordManager` (typically
-    ``manager._credentials``, or whatever a caller like
-    :class:`ItemViewer` obtains from it), so its password is *not*
-    wiped after each individual encrypt/decrypt call: every
-    :func:`pyaescbc.encrypt`/:func:`pyaescbc.decrypt` call below uses
-    ``delete_keys=False`` for exactly this reason — only
-    :meth:`Credentials.clear` (or overwriting it via
-    :meth:`Credentials.set_secondary_password`) is allowed to erase that
-    password. What *does* get wiped after each call, via
-    ``delete_data=True``, is the transient plaintext/ciphertext buffer
-    involved in that one call — never the shared credentials.
+    **In memory.** The item owns its state: it is not a view on a
+    serialized dictionary. Encrypted values are held as
+    :class:`EncryptedValue` instances, so a clear value and an
+    encrypted one can never be confused: clear values are ``str``,
+    encrypted ones are :class:`EncryptedValue`, and decrypted ones are
+    ``bytearray``.
+
+    **Key.** Every operation on an encrypted field takes the
+    :class:`DataKey`. The item never stores it, so an item can be
+    copied, serialized or logged without ever involving the key.
+
+    **Context.** Each encrypted value is bound to its place by the
+    context passed to :meth:`EncryptedValue.seal` (see
+    :meth:`_context`)::
+
+        bippass::item::v3|<item uuid>|field|<field name>   (predefined field)
+        bippass::item::v3|<item uuid>|custom|<custom id>   (custom field)
+
+    A value moved to another item, or to another field of the same
+    item, therefore fails to decrypt. The index of a value within a
+    list is deliberately *not* part of the context: values can be
+    removed or reordered without re-encryption. Only
+    :meth:`change_uuid` and :meth:`change_data_key` re-encrypt values.
+
+    **Dates.** :attr:`creation_date` is set once, when the item is
+    created. :attr:`modification_date` is updated by every user-facing
+    change (every ``set_*``, :meth:`set`, and every ``*_custom``
+    method that changes something), and *only* by those: technical
+    operations (:meth:`change_data_key`, :meth:`change_uuid`,
+    serialization, import) never touch it.
+
+    **Memory.** Decrypted values are returned as ``bytearray`` objects,
+    which the caller is responsible for erasing (e.g. via
+    :func:`pyaescbc.delete_bytearray`). Prefer :meth:`revealed` and
+    :meth:`revealed_custom`, which erase them automatically. Clear
+    ``bytearray`` values given for encrypted fields are erased once
+    they have been successfully encrypted.
+
+    The textual representation of an item (:func:`repr`, :func:`str`)
+    only shows its UUID, so it stays safe to print or log.
+
+    This class performs no locking of its own.
 
     See Also
     --------
     Vault
         Container for multiple :class:`Item` instances.
 
-    PasswordManager
-        Top-level manager responsible for vaults and encryption contexts.
+    EncryptedValue
+        A single sensitive value of an item.
 
-    Credentials
-        Holds the password and iteration count passed to every
-        encrypted-field operation on this class.
+    DataKey
+        The key passed to every encrypted-field operation of this class.
     """
 
-    def __init__(self, item_uuid: str, data: ItemData) -> None:
-        """
-        Initialize an item.
+    __slots__ = (
+        "_uuid", "_name", "_creation_date", "_modification_date",
+        "_fields", "_customs", "_icon", "_color",
+    )
 
-        Parameters
-        ----------
-        item_uuid : str
-            Globally unique identifier of the item.
-        
-        data : ItemData
-            Serialized item data. The dictionary is stored by reference.
-        """
-        self._uuid: str = item_uuid
-        self._data: ItemData = data
-
-    @classmethod
-    def create_empty(cls, item_uuid: str) -> Item:
+    def __init__(self, item_uuid: str) -> None:
         """
         Create an empty item.
 
-        All optional item fields are initialized to ``None``. The item
-        can subsequently be populated using the public setter methods.
-
         Parameters
         ----------
         item_uuid : str
-            Globally unique identifier for the new item.
+            Globally unique identifier of the new item.
 
-        Returns
-        -------
-        Item
-            Newly created empty item.
+        Raises
+        ------
+        UUIDError
+            If ``item_uuid`` is not a UUID in canonical form.
 
         Notes
         -----
-        UUID uniqueness is normally guaranteed by
-        :meth:`PasswordManager.create_uuid` or
-        :meth:`PasswordManager.add_empty_item`.
+        Every field is empty, and both dates are set to now. Global
+        UUID uniqueness is the responsibility of the
+        :class:`PasswordManager` (see :func:`_generate_uuid`).
         """
-        return cls(
-            item_uuid,
-            {
-                "item_name": None,
-                "item_date": datetime.datetime.now().isoformat(),
-                "icon": None,
-                "logins": None,
-                "passwords": None,
-                "totps": None,
-                "websites": None,
-                "phones": None,
-                "emails": None,
-                "custom": None,
-            },
-        )
+        self._uuid: str = _check_uuid(item_uuid)
+        self._name: ClearString | None = None
+        now = _now()
+        self._creation_date: str = now
+        self._modification_date: str = now
+        self._fields: dict[ItemField, list] = {name: [] for name in _FIELDS}
+        self._customs: list[_CustomField] = []
+        self._icon: ClearString | None = None
+        self._color: ClearString | None = None
+
+    # -----------------------
+    # Metadata
+    # -----------------------
 
     @property
     def uuid(self) -> str:
@@ -193,1043 +274,1243 @@ class Item:
         Returns
         -------
         str
-            Item UUID.
+            Item UUID. Use :meth:`change_uuid` to change it.
         """
         return self._uuid
 
-    def _update(self) -> None:
+    @property
+    def creation_date(self) -> str:
         """
-        Udpate the date of the item.
-        """
-        self._data['item_date'] = datetime.datetime.now().isoformat()
+        Return the creation date of the item.
 
-    # --------------------
-    # Encryption
-    # --------------------
-
-    def _decrypt(
-        self,
-        value: CryptedBase64String,
-        password: bytearray,
-    ) -> bytearray:
+        Returns
+        -------
+        str
+            ISO 8601 date and time, with timezone.
         """
-        Decrypt a Base64-encoded encrypted value into a clear-text ``bytearray``.
+        return self._creation_date
+
+    @property
+    def modification_date(self) -> str:
+        """
+        Return the date of the last user modification of the item.
+
+        Returns
+        -------
+        str
+            ISO 8601 date and time, with timezone. See the class-level
+            Notes for which operations update it.
+        """
+        return self._modification_date
+
+    def _touch(self) -> None:
+        """Record a user modification (see the class-level Notes on dates)."""
+        self._modification_date = _now()
+
+    def get_name(self) -> ClearString | None:
+        """
+        Return the item name.
+
+        Returns
+        -------
+        ClearString or None
+            Item name, or ``None`` if unset.
+        """
+        return self._name
+
+    def set_name(self, value: ClearString | None) -> None:
+        """
+        Set the item name.
 
         Parameters
         ----------
-        value : CryptedBase64String
-            Base64-encoded encrypted data, as stored in the item.
+        value : ClearString or None
+            New name, stripped. ``None``, or a blank name, removes it.
 
-        password : bytearray
-            Secondary password used to derive the decryption key, as
-            held by a :class:`Credentials` instance. Passed through
-            unchanged (never wiped, never copied): see the class-level
-            Notes for why.
+        Raises
+        ------
+        TypeError
+            If ``value`` is neither a ``str`` nor ``None``.
 
+        Notes
+        -----
+        Updates :attr:`modification_date`.
+        """
+        self._name = _check_optional_name("name", value)
+        self._touch()
+
+    # -----------------------
+    # GUI
+    # -----------------------
+
+    def get_icon(self) -> ClearString | None:
+        """
+        Return the item icon, used by the graphical interface only.
+
+        Returns
+        -------
+        ClearString or None
+            The icon image, Base64-encoded, or ``None`` if unset.
+        """
+        return self._icon
+
+    def set_icon(self, value: ClearString | None) -> None:
+        """
+        Set the item icon, used by the graphical interface only.
+
+        Parameters
+        ----------
+        value : ClearString or None
+            The icon image, Base64-encoded. ``None`` removes it. Not
+            interpreted nor checked by this class: encoding and
+            decoding the image is the job of the graphical interface.
+
+        Raises
+        ------
+        TypeError
+            If ``value`` is neither a ``str`` nor ``None``.
+
+        Notes
+        -----
+        Updates :attr:`modification_date`.
+        """
+        self._icon = _check_optional_str("icon", value)
+        self._touch()
+
+    def get_color(self) -> ClearString | None:
+        """
+        Return the item color, used by the graphical interface only.
+
+        Returns
+        -------
+        ClearString or None
+            Color, or ``None`` if unset.
+        """
+        return self._color
+
+    def set_color(self, value: ClearString | None) -> None:
+        """
+        Set the item color, used by the graphical interface only.
+
+        Parameters
+        ----------
+        value : ClearString or None
+            New color. ``None`` removes it. Not interpreted nor checked
+            by this class.
+
+        Raises
+        ------
+        TypeError
+            If ``value`` is neither a ``str`` nor ``None``.
+
+        Notes
+        -----
+        Updates :attr:`modification_date`.
+        """
+        self._color = _check_optional_str("color", value)
+        self._touch()
+
+    # -----------------------
+    # Encryption helpers
+    # -----------------------
+
+    def _context(
+        self,
+        scope: Literal["field", "custom"],
+        name: str,
+        *,
+        item_uuid: str | None = None,
+    ) -> bytearray:
+        """
+        Build the context binding an encrypted value to its place.
+
+        Parameters
+        ----------
+        scope : {"field", "custom"}
+            Whether the value belongs to a predefined field or to a
+            custom field.
+
+        name : str
+            Predefined field name, or custom field id.
+
+        item_uuid : str, optional
+            UUID to use instead of :attr:`uuid` (used by
+            :meth:`change_uuid` to build the new context).
 
         Returns
         -------
         bytearray
-            Decrypted data, encoded as UTF-8 bytes. The caller is
-            responsible for erasing this buffer (e.g. via
-            :func:`pyaescbc.delete_bytearray`) once it is no longer
-            needed.
-
-
-        Raises
-        ------
-        TypeError
-            If ``value`` is not a ``str`` or ``password`` is not a
-            ``bytearray``.
-
-        CorruptedBase64Error
-            If ``value`` is not valid Base64 data (invalid padding
-            or characters outside the Base64 alphabet).
-
-        SecondaryPasswordError
-            If ``password`` is wrong, causing authentication of the
-            encrypted data to fail.
-
+            ``bippass::item::v3|<item uuid>|<scope>|<name>``, UTF-8
+            encoded.
 
         Notes
         -----
-        Errors other than the ones listed above (for example a
-        ``ValueError`` or ``TypeError`` raised internally by
-        :func:`pyaescbc.decrypt` because of a malformed argument) are
-        intentionally left unhandled: they indicate a programming
-        error rather than a normal, user-recoverable failure, and
-        should not be disguised as :exc:`SecondaryPasswordError`.
-
-        The decoded ciphertext buffer is wiped after use
-        (``delete_data=True``); ``password`` is left untouched
-        (``delete_keys=False``) since it belongs to a shared
-        :class:`Credentials` instance that outlives this single call.
+        The scope component keeps a custom field from ever sharing its
+        context with a predefined field.
         """
-        if not isinstance(value, str):
-            raise TypeError(f"Expected value as string, got {type(value)}")
-        if not isinstance(password, bytearray):
-            raise TypeError(f"Expected password as bytearray, got {type(password)}")
+        uuid = self._uuid if item_uuid is None else item_uuid
+        return bytearray(f"{_CONTEXT_LABEL}|{uuid}|{scope}|{name}", "utf-8")
 
-        try:
-            encrypted_data: bytearray = bytearray(
-                base64.b64decode(value, validate=True)
-            )
-        except binascii.Error as exc:
-            raise CorruptedBase64Error(
-                "Corrupted item data: invalid Base64 encoding."
-            ) from exc
-
-        try:
-            return pyaescbc.decrypt(
-                encrypted_data, password,
-                delete_keys=False, delete_data=True,
-            )
-        except pyaescbc.AuthError as exc:
-            raise SecondaryPasswordError(
-                "Wrong secondary password."
-            ) from exc
-
-        
-    def _encrypt(
-        self,
-        value: bytearray,
-        password: bytearray,
-        iterations: int,
-    ) -> CryptedBase64String:
+    @staticmethod
+    def _seal_all(
+        values: list[bytearray],
+        data_key: DataKey,
+        context: bytearray,
+    ) -> list[EncryptedValue]:
         """
-        Encrypt a clear-text ``bytearray`` and encode the result as Base64.
-
-        Parameters
-        ----------
-        value : bytearray
-            Clear-text UTF-8 encoded data to encrypt. This buffer is
-            erased (zeroed) before the function returns, regardless
-            of success or failure.
-
-        password : bytearray
-            Secondary password used to derive the encryption key, as
-            held by a :class:`Credentials` instance. Passed through
-            unchanged (never wiped, never copied): see the class-level
-            Notes for why.
-
-        iterations : int
-            Number of iterations used to derive the encryption key.
-
-
-        Returns
-        -------
-        CryptedBase64String
-            Base64-encoded encrypted data, suitable for storage.
-
-
-        Raises
-        ------
-        TypeError
-            If ``value`` is not a ``bytearray``, ``password`` is not
-            a ``bytearray``, or ``iterations`` is not an ``int``.
-
-        SecondaryPasswordError
-            If encryption fails because of an authentication error
-            (for example a mismatched key derivation).
-
+        Encrypt every clear value of a list.
 
         Notes
         -----
-        ``value`` is always erased before this function returns, even
-        if an exception is raised (``delete_data=True``), so that the
-        clear-text secret does not linger in memory beyond the call.
-        ``password`` is left untouched (``delete_keys=False``) since
-        it belongs to a shared :class:`Credentials` instance that
-        outlives this single call.
+        Each clear value is erased once it has been encrypted (see
+        :meth:`EncryptedValue.seal`). If an error occurs partway, the
+        values already encrypted have been erased, the others have not.
         """
-        if not isinstance(value, bytearray):
-            raise TypeError(f"Expected value as bytearray, got {type(value)}")
-        if not isinstance(password, bytearray):
-            raise TypeError(f"Expected password as bytearray, got {type(password)}")
-        if not isinstance(iterations, int):
-            raise TypeError(f"Expected iterations as integer, got {type(iterations)}")
+        return [EncryptedValue.seal(v, data_key, context) for v in values]
 
-        try:
-            encrypted_data: bytearray = pyaescbc.encrypt(
-                value, password, iterations=iterations,
-                delete_keys=False, delete_data=True,
-            )
-        except pyaescbc.AuthError as exc:
-            raise SecondaryPasswordError(
-                "Wrong secondary password or iterations."
-            ) from exc
+    @staticmethod
+    def _reveal_all(
+        values: list[EncryptedValue],
+        data_key: DataKey,
+        context: bytearray,
+    ) -> list[bytearray]:
+        """
+        Decrypt every value of a list.
 
+        Notes
+        -----
+        All-or-nothing: if any value fails to decrypt, the values
+        already decrypted are erased before the exception propagates.
+        """
+        clears: list[bytearray] = []
         try:
-            return base64.b64encode(encrypted_data).decode('utf-8')
+            for v in values:
+                clears.append(v.reveal(data_key, context))
+        except BaseException:
+            for c in clears:
+                pyaescbc.delete_bytearray(c)
+            raise
+        return clears
+
+    @staticmethod
+    @contextmanager
+    def _erasing(clears: list[bytearray]) -> Iterator[list[bytearray]]:
+        """
+        Yield decrypted values, and erase them when the ``with`` block exits.
+
+        Notes
+        -----
+        Shared by :meth:`revealed` and :meth:`revealed_custom`.
+        """
+        try:
+            yield clears
         finally:
-            pyaescbc.delete_bytearray(encrypted_data)
+            for c in clears:
+                pyaescbc.delete_bytearray(c)
 
-    # -----------------------
-    # Internal getter and setters
-    # -----------------------
-    def _decrypt_converter(
-        self,
-        field: str,
-        value: ClearString | CryptedBase64String | ClearStringList | CryptedBase64StringList | None,
-        kind: FieldKind,
-        credentials: Credentials | None,
-    ) -> ClearString | ClearSecretBytes | ClearStringList | ClearSecretBytesList | None:
+    @staticmethod
+    def _reseal_all(
+        values: list[EncryptedValue],
+        old_key: DataKey,
+        old_context: bytearray,
+        new_key: DataKey,
+        new_context: bytearray,
+    ) -> list[EncryptedValue]:
         """
-        Convert a stored item value into its clear-text representation.
-
-        The conversion performed by this method depends on the supplied
-        :class:`FieldKind`. Plain fields are returned without encryption
-        processing, while encrypted fields are decrypted using the
-        secondary password and iteration count held by ``credentials``.
-
-        Parameters
-        ----------
-        field : str
-            Name of the field being converted, used only to build
-            readable error messages.
-
-        value : ClearString or CryptedBase64String or ClearStringList or
-                CryptedBase64StringList or None
-            Value as stored internally by the item.
-
-        kind : FieldKind
-            Storage kind describing how ``value`` is represented.
-
-            ``FieldKind.SCALAR``
-                A single unencrypted string.
-
-            ``FieldKind.ENCRYPTED``
-                A single Base64-encoded encrypted value.
-
-            ``FieldKind.SCALAR_LIST``
-                A list of unencrypted strings.
-
-            ``FieldKind.ENCRYPTED_LIST``
-                A list of Base64-encoded encrypted values.
-
-        credentials : Credentials, optional
-            Holds the secondary password and iteration count used to
-            decrypt ``ENCRYPTED``/``ENCRYPTED_LIST`` values. Required
-            for those two kinds; ignored otherwise.
-
-
-        Returns
-        -------
-        ClearString or ClearSecretBytes or ClearStringList or ClearSecretBytesList or None
-            The field's value: a plain string for scalar fields, a
-            decrypted ``bytearray`` for encrypted fields, a
-            list of strings for clear-list fields, a list of
-            decrypted ``bytearray`` for encrypted-list fields, or
-            ``None`` if the field is not set.
-
-
-        Raises
-        ------
-        ValueError
-            If an encrypted field is accessed without ``credentials``.
-
-        CorruptedBase64Error
-            If an encrypted value contains invalid Base64 data.
-
-        SecondaryPasswordError
-            If decryption fails because the secondary credentials are
-            incorrect or the encrypted data cannot be authenticated.
-
+        Re-encrypt every value of a list under a new key and/or context.
 
         Notes
         -----
-        Decrypted values are returned as ``bytearray`` objects so that
-        callers can explicitly erase their contents from memory when they
-        are no longer required.
-
-        List values are returned as new lists and therefore do not expose
-        the item's internal list object.
+        Each intermediate clear value is always erased, whether its
+        re-encryption succeeds or not.
         """
-        if value is None:
-            return None
+        resealed = []
+        for value in values:
+            clear = value.reveal(old_key, old_context)
+            try:
+                resealed.append(EncryptedValue.seal(clear, new_key, new_context))
+            finally:
+                pyaescbc.delete_bytearray(clear)
+        return resealed
 
-        if kind is FieldKind.SCALAR:
-            if not isinstance(value, str):
-                raise TypeError(f"value must be a string, not {type(value)}")
-            return cast(ClearString, value)
-
-        if kind is FieldKind.ENCRYPTED:
-            if not isinstance(value, str):
-                raise TypeError(f"value must be a string, not {type(value)}")
-            if credentials is None:
-                raise ValueError(
-                    f"{field!r} is an encrypted field: credentials are required."
-                )
-            return cast(ClearSecretBytes, self._decrypt(
-                value,
-                credentials.get_secondary_password(),
-            ))
-
-        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-            raise TypeError(f"value must be a list, not {type(value)}")
-
-        if kind is FieldKind.SCALAR_LIST:
-            if not all(isinstance(v, str) for v in value):
-                raise TypeError("value must contain strings.")
-            return cast(ClearStringList, list(value))
-
-        if kind is FieldKind.ENCRYPTED_LIST:
-            if not all(isinstance(v, str) for v in value):
-                raise TypeError("value must contain base64 strings.")
-            if credentials is None:
-                raise ValueError(
-                    f"{field!r} is an encrypted field: credentials are required."
-                )
-            password = credentials.get_secondary_password()
-            return cast(ClearSecretBytesList, [self._decrypt(v, password) for v in value])
-
-        raise AssertionError(f"unhandled field kind: {kind!r}")  # pragma: no cover
-
-    def _encrypt_converter(
+    def _reseal_everything(
         self,
-        field: str,
-        value: ClearString | ClearSecretBytes | ClearStringList | ClearSecretBytesList | None,
-        kind: FieldKind,
-        credentials: Credentials | None,
-    ) -> ClearString | CryptedBase64String | ClearStringList | CryptedBase64StringList | None:
+        old_key: DataKey,
+        new_key: DataKey,
+        new_uuid: str,
+    ) -> tuple[dict[ItemField, list], list[_CustomField]]:
         """
-        Convert a clear-text item value into its internal representation.
-
-        The conversion performed by this method depends on the supplied
-        :class:`FieldKind`. Plain fields remain unencrypted, while sensitive
-        fields are encrypted using the secondary password and iteration
-        count held by ``credentials``.
+        Re-encrypt every encrypted value, without modifying the item.
 
         Parameters
         ----------
-        field : str
-            Name of the field being converted, used only to build
-            readable error messages.
+        old_key, new_key : DataKey
+            Key the values are currently sealed with, and key to seal
+            them with.
 
-        value : ClearString or ClearSecretBytes or ClearStringList or
-                ClearSecretBytesList or None
-            Clear-text value supplied by the caller.
-
-            ``bytearray`` values are used for encrypted fields so that
-            sensitive data can be explicitly erased from memory.
-
-        kind : FieldKind
-            Storage kind describing how ``value`` must be stored.
-
-            ``FieldKind.SCALAR``
-                Stores a single clear-text string.
-
-            ``FieldKind.ENCRYPTED``
-                Encrypts a single ``bytearray`` and stores the result
-                as a Base64-encoded string.
-
-            ``FieldKind.SCALAR_LIST``
-                Stores a list of clear-text strings.
-
-            ``FieldKind.ENCRYPTED_LIST``
-                Encrypts each ``bytearray`` in the list and stores the
-                resulting Base64 strings.
-
-        credentials : Credentials, optional
-            Holds the secondary password and iteration count used to
-            encrypt ``ENCRYPTED``/``ENCRYPTED_LIST`` values. Required
-            for those two kinds; ignored otherwise.
+        new_uuid : str
+            Item UUID to build the new contexts with.
 
         Returns
         -------
-        ClearString or CryptedBase64String or ClearStringList or CryptedBase64StringList or None
-            Value converted to the representation used internally by
-            the item.
-
-        Raises
-        ------
-        TypeError
-            If ``value`` does not match the type required by ``kind``.
-
-        ValueError
-            If an encrypted field is provided without ``credentials``.
-
-        SecondaryPasswordError
-            If encryption fails because of an authentication error.
+        tuple
+            New ``_fields`` and ``_customs``, to be committed by the
+            caller in one go.
 
         Notes
         -----
-        Encrypted values are converted to Base64 strings after encryption,
-        making them directly serializable to JSON.
-
-        The ``bytearray`` values supplied for encrypted fields are passed
-        to :meth:`_encrypt`, which is responsible for clearing the
-        clear-text buffer after encryption.
+        Nothing is written to the item here: if any value fails, the
+        exception propagates and the item is left exactly as it was.
         """
-        if value is None:
-            return None
-
-        if kind is FieldKind.SCALAR:
-            if not isinstance(value, str):
-                raise TypeError(f"value must be a string, not {type(value)}")
-            return cast(ClearString, value)
-
-        if kind is FieldKind.ENCRYPTED:
-            if not isinstance(value, bytearray):
-                raise TypeError(f"value must be a bytearray, not {type(value)}")
-            if credentials is None:
-                raise ValueError(
-                    f"{field!r} is an encrypted field: credentials are required."
+        fields = {
+            name: (
+                self._reseal_all(
+                    values,
+                    old_key, self._context("field", name),
+                    new_key, self._context("field", name, item_uuid=new_uuid),
                 )
-            return cast(CryptedBase64String, self._encrypt(
-                value,
-                credentials.get_secondary_password(),
-                credentials.get_secondary_iterations(),
-            ))
-
-        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-            raise TypeError(f"value must be a list, not {type(value)}")
-
-        if kind is FieldKind.SCALAR_LIST:
-            if not all(isinstance(v, str) for v in value):
-                raise TypeError("value must contain strings.")
-            return cast(ClearStringList, list(value))
-
-        if kind is FieldKind.ENCRYPTED_LIST:
-            if credentials is None:
-                raise ValueError(
-                    f"{field!r} is an encrypted field: credentials are required."
+                if _FIELDS[name] is FieldKind.ENCRYPTED else list(values)
+            )
+            for name, values in self._fields.items()
+        }
+        customs = [
+            _CustomField(
+                custom.id, custom.name, custom.kind,
+                self._reseal_all(
+                    custom.values,
+                    old_key, self._context("custom", custom.id),
+                    new_key, self._context("custom", custom.id, item_uuid=new_uuid),
                 )
-            if not all(isinstance(v, bytearray) for v in value):
-                raise TypeError("value must contain bytearray.")
-            password = credentials.get_secondary_password()
-            iterations = credentials.get_secondary_iterations()
-            return cast(CryptedBase64StringList, [
-                self._encrypt(v, password, iterations) for v in value
-            ])
-
-        raise AssertionError(f"unhandled field kind: {kind!r}")  # pragma: no cover
+                if custom.kind is FieldKind.ENCRYPTED else list(custom.values),
+            )
+            for custom in self._customs
+        ]
+        return fields, customs
 
     # -----------------------
-    # Getters and Setters
+    # Predefined fields
     # -----------------------
-    def _kind_of(self, field: str) -> FieldKind:
-        """Return the storage kind associated with a field name.
 
-        Parameters
-        ----------
-        field : str
-            Name of the item field to look up.
-
-        Returns
-        -------
-        FieldKind
-            Storage kind describing how ``field`` is represented
-            (scalar, encrypted, clear list, or encrypted list).
+    @staticmethod
+    def _kind_of(name: str) -> FieldKind:
+        """
+        Return the kind of a predefined field.
 
         Raises
         ------
         KeyError
-            If ``field`` is not a recognized item field.
+            If ``name`` is not a predefined field.
         """
         try:
-            return _FIELDS[field]
+            return _FIELDS[cast(ItemField, name)]
         except KeyError:
             raise KeyError(
-                f"{field!r} is not a known item field, expected one of {tuple(_FIELDS)}"
+                f"{name!r} is not a known item field, expected one of {tuple(_FIELDS)}"
             ) from None
+
+    @overload
+    def get(self, field: ClearField, *, data_key: DataKey | None = None) -> ClearStringList: ...
+
+    @overload
+    def get(self, field: SecretField, *, data_key: DataKey | None = None) -> ClearSecretBytesList: ...
+
+    @overload
+    def get(
+        self, field: ItemField, *, data_key: DataKey | None = None
+    ) -> ClearStringList | ClearSecretBytesList: ...
 
     def get(
         self,
         field: ItemField,
         *,
-        credentials: Credentials | None = None,
-    ) -> ClearString | ClearSecretBytes | ClearStringList | ClearSecretBytesList | None:
-        """Return the value of an item field.
+        data_key: DataKey | None = None,
+    ) -> ClearStringList | ClearSecretBytesList:
+        """
+        Return the values of a predefined field.
 
         Parameters
         ----------
         field : ItemField
-            Name of the field to retrieve. See :data:`_FIELDS` for the
-            set of recognized fields.
+            Name of the field to retrieve. See the class-level Notes
+            for the predefined fields.
 
-        credentials : Credentials, optional
-            Holds the secondary password and iteration count used to
-            decrypt the field. Required only when ``field`` is an
-            encrypted field (e.g. ``"passwords"``, ``"totps"``).
+        data_key : DataKey, optional
+            Key used to decrypt the field. Required only when ``field``
+            is an encrypted field (``"passwords"``, ``"totps"``).
 
 
         Returns
         -------
-        ClearString or ClearSecretBytes or ClearStringList or ClearSecretBytesList or None
-            The field's value: a plain string for scalar fields, a
-            decrypted ``bytearray`` for encrypted fields, a
-            list of strings for clear-list fields, a list of
-            decrypted ``bytearray`` for encrypted fields, or
-            ``None`` if the field is not set.
+        ClearStringList or ClearSecretBytesList
+            A new list of ``str`` for a clear field, a new list of
+            decrypted ``bytearray`` for an encrypted field. The caller
+            is responsible for erasing the decrypted buffers, or should
+            use :meth:`revealed` instead.
 
 
         Raises
         ------
         KeyError
-            If ``field`` is not a recognized item field.
+            If ``field`` is not a predefined field.
 
         ValueError
-            If ``field`` is an encrypted field and ``credentials`` is
-            not provided.
+            If ``field`` is an encrypted field and ``data_key`` is not
+            provided, or ``data_key`` has been cleared.
 
-        SecondaryPasswordError
-            If decryption fails because of a wrong password or
-            corrupted data.
+        TamperedDataError
+            If a value fails to decrypt (see :meth:`EncryptedValue.reveal`).
 
 
         Notes
         -----
-        List fields are returned as new lists, never a reference to
-        the item's internal storage: mutating the returned list does
-        not affect the item.
+        Returned lists are always new lists: mutating them does not
+        affect the item. Decryption is all-or-nothing: if any value
+        fails, none is returned and the ones already decrypted are
+        erased.
         """
         kind = self._kind_of(field)
-        value = self._data[field]
-        try:
-            return self._decrypt_converter(field, value, kind, credentials)
-        except TypeError as exc:
-            raise TypeError(
-                f"Error getting field '{field}' with kind '{kind}' - {exc}. Value is '{value}'"
-            ) from exc
-    
-    def set(
+        if kind is FieldKind.CLEAR:
+            return list(self._fields[field])
+        if data_key is None:
+            raise ValueError(f"{field!r} is an encrypted field: data_key is required.")
+        return self._reveal_all(self._fields[field], data_key, self._context("field", field))
+
+    @contextmanager
+    def revealed(
         self,
-        field: ItemField,
-        value: ClearString | ClearSecretBytes | ClearStringList | ClearSecretBytesList | None,
-        *,
-        credentials: Credentials | None = None,
-    ) -> None:
-        """Set the value of an item field.
+        field: Literal["passwords", "totps"],
+        data_key: DataKey,
+    ) -> Iterator[ClearSecretBytesList]:
+        """
+        Decrypt an encrypted field for the duration of a ``with`` block.
+
+        Parameters
+        ----------
+        field : {"passwords", "totps"}
+            Encrypted predefined field to decrypt.
+
+        data_key : DataKey
+            Key used to decrypt the field.
+
+
+        Yields
+        ------
+        ClearSecretBytesList
+            The decrypted values. Erased when the ``with`` block exits,
+            normally or through an exception: do not keep a reference
+            to them beyond the block.
+
+
+        Raises
+        ------
+        KeyError, ValueError, TamperedDataError
+            See :meth:`get`.
+
+        TypeError
+            If ``field`` is not an encrypted field.
+
+
+        Examples
+        --------
+        >>> with item.revealed("totps", data_key) as secrets:
+        ...     code, remaining = generate_totp_code(secrets[0])
+        """
+        if self._kind_of(field) is not FieldKind.ENCRYPTED:
+            raise TypeError(f"{field!r} is not an encrypted field.")
+        with self._erasing(cast(list[bytearray], self.get(field, data_key=data_key))) as clears:
+            yield clears
+
+    def count(self, field: ItemField) -> int:
+        """
+        Return the number of values of a predefined field, without decrypting.
 
         Parameters
         ----------
         field : ItemField
-            Name of the field to update. See :data:`_FIELDS` for the
-            set of recognized fields.
+            Name of the field.
 
-        value : ClearString or ClearSecretBytes or ClearStringList or ClearSecretBytesList or None
-            New field value. Must be a ``str`` for scalar fields, a
-            decrypted ``bytearray`` for encrypted fields, a
-            list of ``str`` for clear-list fields, or a list of
-            ``bytearray`` for encrypted-list fields. ``None`` removes
-            the value.
+        Returns
+        -------
+        int
+            Number of values stored in ``field``.
 
-        credentials : Credentials, optional
-            Holds the secondary password and iteration count used to
-            encrypt the field. Required only when ``field`` is an
-            encrypted field.
+        Raises
+        ------
+        KeyError
+            If ``field`` is not a predefined field.
+        """
+        self._kind_of(field)
+        return len(self._fields[field])
+
+    def set(
+        self,
+        field: ItemField,
+        values: ClearStringList | ClearSecretBytesList,
+        *,
+        data_key: DataKey | None = None,
+    ) -> None:
+        """
+        Replace the values of a predefined field.
+
+        Parameters
+        ----------
+        field : ItemField
+            Name of the field to update. See the class-level Notes for
+            the predefined fields.
+
+        values : ClearStringList or ClearSecretBytesList
+            New values: a list of ``str`` for a clear field, a list of
+            clear ``bytearray`` for an encrypted field. An empty list
+            clears the field.
+
+        data_key : DataKey, optional
+            Key used to encrypt the field. Required only when ``field``
+            is an encrypted field.
 
 
         Raises
         ------
         KeyError
-            If ``field`` is not a recognized item field.
+            If ``field`` is not a predefined field.
 
         TypeError
-            If ``value`` does not match the expected type for
-            ``field``'s kind.
+            If ``values`` does not match the field's kind.
 
         ValueError
-            If ``field`` is an encrypted field and ``credentials`` is
-            not provided.
+            If ``field`` is an encrypted field and ``data_key`` is not
+            provided, or ``data_key`` has been cleared.
+
+
+        Notes
+        -----
+        Updates :attr:`modification_date`.
+
+        For an encrypted field, every clear ``bytearray`` of ``values``
+        is erased once it has been encrypted. The field is replaced
+        only once *every* value has been encrypted: if an error occurs
+        partway, the item is left unchanged (but the values already
+        encrypted have been erased).
         """
         kind = self._kind_of(field)
-        try:
-            self._data[field] = self._encrypt_converter(field, value, kind, credentials)
-        except TypeError as exc:
-            raise TypeError(
-                f"Error setting field '{field}' with kind '{kind}' - {exc}. Given value is '{value}'"
-            ) from exc
-        self._update()
-
+        if kind is FieldKind.CLEAR:
+            self._fields[field] = _check_clear_list(field, values)
+        else:
+            clears = _check_secret_list(field, values)
+            if data_key is None:
+                raise ValueError(f"{field!r} is an encrypted field: data_key is required.")
+            self._fields[field] = self._seal_all(clears, data_key, self._context("field", field))
+        self._touch()
 
     # --------------------
-    # Custom field
-    # --------------------    
-    def custom_fields(self) -> Tuple[str, ...]:
-        """Return the names of the custom fields.
+    # Custom fields
+    # --------------------
+
+    def _custom(self, custom_id: str) -> _CustomField:
+        """
+        Return a custom field by id.
+
+        Raises
+        ------
+        UUIDError
+            If ``custom_id`` is not a UUID, or no custom field has it.
+        """
+        return self._customs[_get_uuid_index(custom_id, [c.id for c in self._customs])]
+
+    def custom_ids(self) -> tuple[str, ...]:
+        """
+        Return the ids of the custom fields, in display order.
 
         Returns
         -------
         tuple of str
-            Names of the custom fields currently set on this
-            item. Empty tuple if none are set.
+            Ids of every custom field. Empty tuple if there is none.
         """
-        store = self._data["custom"]
-        return tuple(store) if store else ()
+        return tuple(c.id for c in self._customs)
 
-    def _custom_kind_map(self, kind: str) -> FieldKind:
+    def custom_name(self, custom_id: str) -> str:
         """
-        Return the storage kind associated with a kind name.
+        Return the name of a custom field.
 
         Parameters
         ----------
-        kind : str
-            Name of the item kind to look up.
+        custom_id : str
+            Id of the custom field.
+
+        Returns
+        -------
+        str
+            Display name of the field.
+
+        Raises
+        ------
+        UUIDError
+            If no custom field has this id.
+        """
+        return self._custom(custom_id).name
+
+    def custom_kind(self, custom_id: str) -> FieldKind:
+        """
+        Return the kind of a custom field.
+
+        Parameters
+        ----------
+        custom_id : str
+            Id of the custom field.
 
         Returns
         -------
         FieldKind
-            Storage kind describing how ``field`` is represented
-            (scalar, encrypted, clear list, or encrypted list).
+            Whether the field is clear or encrypted.
 
         Raises
         ------
-        KeyError
-            If ``field`` is not a recognized item field.
+        UUIDError
+            If no custom field has this id.
         """
-        try:
-            return _CUSTOM_KINDS[kind]
-        except KeyError:
-            raise KeyError(
-                f"{kind!r} is not a known item kind, expected one of {tuple(_CUSTOM_KINDS)}"
-            ) from None
+        return self._custom(custom_id).kind
 
-    def get_custom(
-        self,
-        field: str,
-        *,
-        credentials: Credentials | None = None,
-    ) -> ClearString | ClearSecretBytes | ClearStringList | ClearSecretBytesList | None:
-        """Return the value of a custom item field.
+    def custom_count(self, custom_id: str) -> int:
+        """
+        Return the number of values of a custom field, without decrypting.
 
         Parameters
         ----------
-        field : str
-            Name of the field to retrieve.
+        custom_id : str
+            Id of the custom field.
 
-        credentials : Credentials, optional
-            Holds the secondary password and iteration count used to
-            decrypt the field. Required only when ``field`` is an
+        Returns
+        -------
+        int
+            Number of values of the field.
+
+        Raises
+        ------
+        UUIDError
+            If no custom field has this id.
+        """
+        return len(self._custom(custom_id).values)
+
+    def _seal_custom(
+        self,
+        custom_id: str,
+        kind: FieldKind,
+        values: Any,
+        data_key: DataKey | None,
+        where: str,
+    ) -> list:
+        """
+        Check the values of a custom field and convert them for storage.
+
+        Returns
+        -------
+        list of str or list of EncryptedValue
+            A new list, ready to be stored.
+        """
+        if kind is FieldKind.CLEAR:
+            return _check_clear_list(where, values)
+        clears = _check_secret_list(where, values)
+        if data_key is None:
+            raise ValueError(f"{where} is an encrypted field: data_key is required.")
+        return self._seal_all(clears, data_key, self._context("custom", custom_id))
+
+    def add_custom(
+        self,
+        name: str,
+        kind: FieldKind | CustomKind,
+        values: ClearStringList | ClearSecretBytesList,
+        *,
+        data_key: DataKey | None = None,
+    ) -> str:
+        """
+        Add a new custom field at the end of the custom fields.
+
+        Parameters
+        ----------
+        name : str
+            Display name of the field. Must not be empty; may be shared
+            with other custom fields.
+
+        kind : FieldKind or CustomKind
+            ``FieldKind.CLEAR``/``"clear"`` or
+            ``FieldKind.ENCRYPTED``/``"encrypted"``.
+
+        values : ClearStringList or ClearSecretBytesList
+            Initial values: a list of ``str`` for a clear field, a list
+            of clear ``bytearray`` for an encrypted field. May be empty.
+
+        data_key : DataKey, optional
+            Key used to encrypt the values. Required only for an
             encrypted field.
 
 
         Returns
         -------
-        ClearString or ClearSecretBytes or ClearStringList or ClearSecretBytesList or None
-            The field's value: a plain string for scalar fields, a
-            decrypted ``bytearray`` for encrypted fields, a
-            list of strings for clear-list fields, a list of
-            decrypted ``bytearray`` for encrypted-list fields, or
-            ``None`` if the field is not set.
+        str
+            The id of the new field, generated so that it is unique
+            within this item.
 
 
         Raises
         ------
-        KeyError
-            If ``field`` is not a recognized item field.
+        TypeError
+            If ``name`` is not a ``str``, or ``values`` does not match
+            ``kind``.
 
         ValueError
-            If ``field`` is an encrypted field and ``credentials`` is
-            not provided.
-
-        SecondaryPasswordError
-            If decryption fails because of a wrong password or
-            corrupted data.
+            If ``name`` is empty, ``kind`` is unknown, or the field is
+            encrypted and ``data_key`` is not provided or has been
+            cleared.
 
 
         Notes
         -----
-        List fields are returned as new lists, never a reference to
-        the item's internal storage: mutating the returned list does
-        not affect the item.
+        Updates :attr:`modification_date`. Clear ``bytearray`` values
+        are erased once encrypted, as in :meth:`set`.
         """
-        store = self._data["custom"] or {}
-        if field not in store:
-            raise KeyError(f"{field!r} not in {tuple(store)}")
+        name = _check_name("name", name)
+        field_kind = _to_kind(kind)
+        custom_id = _generate_uuid(self.custom_ids())
+        stored = self._seal_custom(custom_id, field_kind, values, data_key, f"custom field {name!r}")
+        self._customs.append(_CustomField(custom_id, name, field_kind, stored))
+        self._touch()
+        return custom_id
 
-        kindstr, value = store[field]
-        kind = self._custom_kind_map(kindstr)
-
-        try:
-            return self._decrypt_converter(field, value, kind, credentials)
-        except TypeError as exc:
-            raise TypeError(
-                f"Error getting custom field '{field}' with kind '{kind}' - {exc}. Value is '{value}'"
-            ) from exc
-
-
-    def set_custom(
+    def get_custom(
         self,
-        field: str,
-        value: ClearString | ClearSecretBytes | ClearStringList | ClearSecretBytesList | None,
-        kindstr: ItemKind | None,
+        custom_id: str,
         *,
-        credentials: Credentials | None = None,
-    ) -> None:
+        data_key: DataKey | None = None,
+    ) -> ClearStringList | ClearSecretBytesList:
         """
-        Set the value of a custom item field.
+        Return the values of a custom field.
 
         Parameters
         ----------
-        field : str
-            Name of the field to update. 
+        custom_id : str
+            Id of the custom field.
 
-        value : ClearString or ClearSecretBytes or ClearStringList or ClearSecretBytesList or None
-            New field value. Must be a ``str`` for scalar fields, a
-            decrypted ``bytearray`` for encrypted fields, a
-            list of ``str`` for clear-list fields, or a list of
-            ``bytearray`` for encrypted-list fields. ``None`` removes
-            the value.
-
-        kindstr : ItemKind or None
-            The kind of the setted item. 
-            None is accepted only if the field already exist.
-
-        credentials : Credentials, optional
-            Holds the secondary password and iteration count used to
-            encrypt the field. Required only when ``field`` is an
+        data_key : DataKey, optional
+            Key used to decrypt the field. Required only for an
             encrypted field.
 
 
+        Returns
+        -------
+        ClearStringList or ClearSecretBytesList
+            A new list of ``str`` for a clear field, a new list of
+            decrypted ``bytearray`` for an encrypted field. The caller
+            is responsible for erasing the decrypted buffers, or should
+            use :meth:`revealed_custom` instead.
+
+
         Raises
         ------
-        KeyError
-            If ``field`` is not a recognized item field.
-
-        TypeError
-            If ``value`` does not match the expected type for
-            ``field``'s kind.
+        UUIDError
+            If no custom field has this id.
 
         ValueError
-            If ``field`` is an encrypted field and ``credentials`` is
-            not provided.
+            If the field is encrypted and ``data_key`` is not provided,
+            or ``data_key`` has been cleared.
+
+        TamperedDataError
+            If a value fails to decrypt.
         """
-        if not isinstance(field, str):
-            raise TypeError(f"field must be a string, not {type(field)}")
-        
-        if kindstr is None:
-            if field not in self.custom_fields():
-                raise TypeError(f"kindstr must be a string, not {type(kindstr)}")
-            kindstr = self._data["custom"][field][0]
-            
-        kind = self._custom_kind_map(kindstr)
+        custom = self._custom(custom_id)
+        if custom.kind is FieldKind.CLEAR:
+            return list(custom.values)
+        if data_key is None:
+            raise ValueError(f"Custom field {custom.name!r} is encrypted: data_key is required.")
+        return self._reveal_all(custom.values, data_key, self._context("custom", custom.id))
 
-        try:
-            value = self._encrypt_converter(field, value, kind, credentials)
-        except TypeError as exc:
-            raise TypeError(
-                f"Error setting custom field '{field}' with kind '{kind}' - {exc}. Given value is '{value}'"
-            ) from exc
-        
-        if not self._data['custom']:
-            self._data['custom'] = {}
-        
-        self._data['custom'][field] = (kindstr, value)
-        self._update()
-
-    def remove_custom(
+    @contextmanager
+    def revealed_custom(
         self,
-        field: str,
-    ) -> None:
+        custom_id: str,
+        data_key: DataKey,
+    ) -> Iterator[ClearSecretBytesList]:
         """
-        Remove a custom item field.
+        Decrypt an encrypted custom field for the duration of a ``with`` block.
 
         Parameters
         ----------
-        field : str
-            Name of the custom field to remove.
+        custom_id : str
+            Id of the encrypted custom field.
+
+        data_key : DataKey
+            Key used to decrypt the field.
+
+
+        Yields
+        ------
+        ClearSecretBytesList
+            The decrypted values. Erased when the ``with`` block exits.
+
 
         Raises
         ------
-        TypeError
-            If ``field`` is not a string.
+        UUIDError, ValueError, TamperedDataError
+            See :meth:`get_custom`.
 
-        KeyError
-            If ``field`` does not exist.
+        TypeError
+            If the field is not encrypted.
+        """
+        if self.custom_kind(custom_id) is not FieldKind.ENCRYPTED:
+            raise TypeError(f"Custom field {custom_id} is not encrypted.")
+        with self._erasing(cast(list[bytearray], self.get_custom(custom_id, data_key=data_key))) as clears:
+            yield clears
+
+    def set_custom(
+        self,
+        custom_id: str,
+        values: ClearStringList | ClearSecretBytesList,
+        *,
+        data_key: DataKey | None = None,
+    ) -> None:
+        """
+        Replace the values of a custom field.
+
+        Parameters
+        ----------
+        custom_id : str
+            Id of the custom field.
+
+        values : ClearStringList or ClearSecretBytesList
+            New values, matching the field's kind.
+
+        data_key : DataKey, optional
+            Key used to encrypt the values. Required only if the field
+            is encrypted.
+
+
+        Raises
+        ------
+        UUIDError
+            If no custom field has this id.
+
+        TypeError
+            If ``values`` does not match the kind.
+
+        ValueError
+            If the field is encrypted and ``data_key`` is not provided
+            or has been cleared.
+
 
         Notes
         -----
-        Removing an encrypted custom field only removes its encrypted
-        representation from the item. No decryption is performed.
-
-        If the item no longer contains any custom fields after removal,
-        the internal custom-field storage is set to ``None``.
-
-        Examples
-        --------
-        >>> item.remove_custom("RecoveryCode")
+        Updates :attr:`modification_date`. The field keeps its id, name,
+        kind and position: the kind of a custom field is chosen once
+        and for all by :meth:`add_custom`. The values are replaced only
+        once every one of them has been converted: if an error occurs,
+        the field is left unchanged.
         """
-        if not isinstance(field, str):
-            raise TypeError(
-                f"field must be a string, not {type(field)}"
-            )
+        custom = self._custom(custom_id)
+        custom.values = self._seal_custom(
+            custom.id, custom.kind, values, data_key, f"custom field {custom.name!r}"
+        )
+        self._touch()
 
-        store = self._data["custom"]
-
-        if not store or field not in store:
-            raise KeyError(
-                f"{field!r} is not a custom field."
-            )
-
-        del store[field]
-
-        if not store:
-            self._data["custom"] = None
-
-        self._update()
-
-    # ----------------
-    # Force
-    # ----------------
-    def _force_encrypt(
-        self,
-        credentials: Credentials,
-    ) -> None:
+    def rename_custom(self, custom_id: str, name: str) -> None:
         """
-        Considering each CryptedBase64String of the ItemData as ClearString.
-        Use the given credentials to encrypt all the sensitive datas.
-        
-        .. warning::
-
-            Do not use on encrypted items !
+        Rename a custom field.
 
         Parameters
         ----------
-        credentials : Credentials
-            Holds the secondary password and iteration count used to
-            encrypt every sensitive field.
+        custom_id : str
+            Id of the custom field.
 
+        name : str
+            New display name. Must not be empty; may be shared with
+            other custom fields.
 
         Raises
         ------
+        UUIDError
+            If no custom field has this id.
+
         TypeError
-            If a stored value cannot be converted to the ``bytearray``
-            expected for its field kind.
+            If ``name`` is not a ``str``.
 
-        SecondaryPasswordError
-            If encryption fails because of an authentication error
-            (for example a mismatched key derivation).
-        """
-        for field, kind in _FIELDS.items():
-            value = self._data[field]
-
-            if value is not None:
-                if kind is FieldKind.ENCRYPTED:
-                    value = bytearray(value, 'utf-8')
-                if kind is FieldKind.ENCRYPTED_LIST:
-                    value = list(bytearray(v, 'utf-8') for v in value)
-            
-            self.set(
-                field, 
-                value,
-                credentials=credentials,
-            )
-
-        store = self._data['custom'] or {}
-        for field, (kindstr, value) in store.items():
-            kind = self._custom_kind_map(kindstr)
-
-            if value is not None:
-                if kind is FieldKind.ENCRYPTED:
-                    value = bytearray(value, 'utf-8')
-                if kind is FieldKind.ENCRYPTED_LIST:
-                    value = list(bytearray(v, 'utf-8') for v in value)
-            
-            self.set_custom(
-                field, 
-                value,
-                kindstr,
-                credentials=credentials,
-            )
-
-    def _force_decrypt(
-        self,
-        credentials: Credentials,
-    ) -> None:
-        """
-        Decrypt each CryptedBase64String of the ItemData to ClearString.
-        Use the given credentials to decrypt all the sensitive datas.
-        
-        .. warning::
-
-            Thiw will remove the encryption of the full item !
-
-        Parameters
-        ----------
-        credentials : Credentials
-            Holds the secondary password and iteration count used to
-            decrypt every sensitive field.
-
-
-        Raises
-        ------
-        TypeError
-            If a decrypted value cannot be converted back to ``str``.
-
-        SecondaryPasswordError
-            If decryption fails because of an authentication error
-            (for example a mismatched key derivation).
-        """
-        for field, kind in _FIELDS.items():
-            value = self.get(
-                field, 
-                credentials=credentials,
-            )
-
-            if value is not None:
-                if kind is FieldKind.ENCRYPTED:
-                    value = value.decode('utf-8')
-                if kind is FieldKind.ENCRYPTED_LIST:
-                    value = list(v.decode('utf-8') for v in value)
-            
-            self._data[field] = value
-
-        store = self._data['custom'] or {}
-        for field, (kindstr, value) in store.items():
-            kind = self._custom_kind_map(kindstr)
-            value = self.get_custom(
-                field, 
-                credentials=credentials,
-            )
-
-            if value is not None:
-                if kind is FieldKind.ENCRYPTED:
-                    value = value.decode('utf-8')
-                if kind is FieldKind.ENCRYPTED_LIST:
-                    value = list(v.decode('utf-8') for v in value)
-            
-            store[field] = (kindstr, value)
-
-    def change_credentials(
-        self,
-        old_credentials: Credentials,
-        new_credentials: Credentials,
-    ) -> None:
-        """
-        Re-encrypt all sensitive data with new secondary credentials.
-        
-        This method allows changing the secondary password and/or
-        iteration count by re-encrypting all item data, decrypting
-        every field with ``old_credentials`` and re-encrypting it with
-        ``new_credentials``.
-        
-        .. warning::
-
-            All data will be encrypted with the new credentials!
-            ``old_credentials`` will no longer work for this item
-            after this operation.
-
-        Parameters
-        ----------
-        old_credentials : Credentials
-            Holds the secondary password and iteration count
-            currently used to encrypt this item's data.
-
-        new_credentials : Credentials
-            Holds the secondary password and iteration count to
-            re-encrypt this item's data with.
-
-        Raises
-        ------
-        SecondaryPasswordError
-            If decryption fails because of an authentication error
-            (for example a mismatched old key derivation).
+        ValueError
+            If ``name`` is empty.
 
         Notes
         -----
-        Atomic with respect to ``old_credentials`` failures: every
-        field — standard and custom — is decrypted with
-        ``old_credentials`` first, all of them, before anything is
-        written back. If any field fails to decrypt (wrong
-        ``old_credentials``, corrupted data), this method raises
-        during that first pass, before touching ``self._data`` at
-        all, so the item is left exactly as it was.
-
-        Only once every field has been successfully decrypted does
-        the second pass run: re-encrypting and writing each field
-        with ``new_credentials``. That pass does not decrypt
-        anything, so it should not normally fail the way the first
-        pass can — but it is not itself guarded. If it did fail
-        partway through (a programming error, not a wrong password),
-        the item could be left with some fields already under
-        ``new_credentials`` and others still under
-        ``old_credentials``. See :meth:`Vault.change_credentials`
-        for the same decrypt-everything-first, then
-        commit-everything pattern applied across a whole vault.
-
-        Renamed from the original ``change_credantials`` (a typo) to
-        ``change_credentials`` while this method was already being
-        updated to take :class:`Credentials` instances instead of
-        separate password/iteration arguments — update any caller
-        accordingly.
+        Updates :attr:`modification_date`. No re-encryption is needed:
+        the context of encrypted values uses the field id, not its
+        name, so no key is required.
         """
-        # Phase 1 -- decrypt everything with `old_credentials` first,
-        # writing nothing back yet. A failure here (wrong password,
-        # corrupted data) raises before any mutation happens.
-        standard_values = {
-            field: self.get(field, credentials=old_credentials)
-            for field in _FIELDS
-        }
+        custom = self._custom(custom_id)
+        custom.name = _check_name("name", name)
+        self._touch()
 
-        custom_store = self._data['custom'] or {}
-        custom_values = {
-            field: (kindstr, self.get_custom(field, credentials=old_credentials))
-            for field, (kindstr, _stored) in custom_store.items()
-        }
+    def move_custom(self, custom_id: str, index: int) -> None:
+        """
+        Move a custom field to another position.
 
-        # Phase 2 -- everything above decrypted successfully, so it is
-        # now safe to re-encrypt and commit every field with
-        # `new_credentials`.
-        for field, value in standard_values.items():
-            self.set(field, value, credentials=new_credentials)
+        Parameters
+        ----------
+        custom_id : str
+            Id of the custom field.
 
-        for field, (kindstr, value) in custom_values.items():
-            self.set_custom(field, value, kindstr, credentials=new_credentials)
+        index : int
+            New position, as for :meth:`list.insert` (``0`` moves it
+            first, ``len(item.custom_ids())`` or more moves it last).
 
-        self._update()
-            
+        Raises
+        ------
+        UUIDError
+            If no custom field has this id.
+
+        TypeError
+            If ``index`` is not an ``int``.
+
+        Notes
+        -----
+        Updates :attr:`modification_date`. No re-encryption is needed.
+        """
+        _check_index("index", index)
+        custom = self._custom(custom_id)
+        self._customs.remove(custom)
+        self._customs.insert(index, custom)
+        self._touch()
+
+    def remove_custom(self, custom_id: str) -> None:
+        """
+        Remove a custom field.
+
+        Parameters
+        ----------
+        custom_id : str
+            Id of the custom field to remove.
+
+        Raises
+        ------
+        UUIDError
+            If no custom field has this id.
+
+        Notes
+        -----
+        Updates :attr:`modification_date`. No decryption is performed:
+        no key is needed.
+        """
+        self._customs.remove(self._custom(custom_id))
+        self._touch()
+
+    # ----------------
+    # Re-encryption
+    # ----------------
+
+    def change_data_key(self, old_key: DataKey, new_key: DataKey) -> None:
+        """
+        Re-encrypt every encrypted value with a new data key.
+
+        Parameters
+        ----------
+        old_key : DataKey
+            Key every encrypted value is currently sealed with.
+
+        new_key : DataKey
+            Key to re-seal them with.
+
+
+        Raises
+        ------
+        ValueError
+            If either key has been cleared.
+
+        TamperedDataError
+            If a value fails to decrypt with ``old_key``.
+
+
+        Notes
+        -----
+        Used to move an item to another profile (export and import),
+        and, through :meth:`_prepare_change_data_key`, when the
+        secondary password is changed, which always draws a new data
+        key (see :meth:`PasswordManager.change_secondary_password`).
+
+        Atomic: every value is re-encrypted first, and the item is
+        updated in one go only once all of them succeeded. If any value
+        fails, the item is left exactly as it was.
+
+        Does not update :attr:`modification_date`.
+        """
+        self._prepare_change_data_key(old_key, new_key)()
+
+    def _prepare_change_data_key(
+        self,
+        old_key: DataKey,
+        new_key: DataKey,
+    ) -> Callable[[], None]:
+        """
+        Re-encrypt every encrypted value with a new key, without committing.
+
+        Parameters
+        ----------
+        old_key, new_key : DataKey
+            See :meth:`change_data_key`.
+
+        Returns
+        -------
+        callable
+            A function taking no argument that commits the re-encrypted
+            values to the item. It cannot fail.
+
+        Raises
+        ------
+        ValueError, TamperedDataError
+            See :meth:`change_data_key`.
+
+        Notes
+        -----
+        Two-phase version of :meth:`change_data_key`, so that a
+        container (:class:`Vault`, :class:`PasswordManager`) can
+        prepare *every* item first and commit all of them only once
+        all succeeded, while keeping the very same :class:`Item`
+        instances (references held elsewhere, e.g. by an open editor,
+        stay valid). Nothing is modified until the returned function is
+        called.
+        """
+        fields, customs = self._reseal_everything(old_key, new_key, self._uuid)
+
+        def commit() -> None:
+            self._fields, self._customs = fields, customs
+
+        return commit
+
+    def change_uuid(self, new_uuid: str, data_key: DataKey) -> None:
+        """
+        Give the item a new UUID, re-encrypting its values accordingly.
+
+        Parameters
+        ----------
+        new_uuid : str
+            New UUID of the item.
+
+        data_key : DataKey
+            Key every encrypted value is sealed with. The item UUID is
+            part of the context of every encrypted value (see the
+            class-level Notes), so they are all re-encrypted under the
+            new UUID.
+
+
+        Raises
+        ------
+        UUIDError
+            If ``new_uuid`` is not a UUID in canonical form.
+
+        ValueError
+            If ``data_key`` has been cleared.
+
+        TamperedDataError
+            If a value fails to decrypt.
+
+
+        Notes
+        -----
+        Rarely needed: only when an item imported from another account
+        has a UUID that collides with an existing one. Global UUID
+        uniqueness is the responsibility of the :class:`PasswordManager`,
+        which chooses ``new_uuid`` (see :func:`_generate_uuid`).
+
+        Atomic: the UUID and the values are updated in one go, only
+        once every value has been re-encrypted.
+
+        Does not update :attr:`modification_date`.
+        """
+        new_uuid = _check_uuid(new_uuid)
+        if new_uuid == self._uuid:
+            return
+        fields, customs = self._reseal_everything(data_key, data_key, new_uuid)
+        self._uuid, self._fields, self._customs = new_uuid, fields, customs
+
     # -----------------
-    # Export
+    # Serialization
     # -----------------
+
     def to_dict(self) -> ItemData:
         """
-        Return the serialized item data.
+        Serialize the item.
 
         Returns
         -------
         ItemData
-            Internal item representation suitable for JSON serialization.
+            A new dictionary, suitable for JSON serialization (see the
+            class-level Notes for its structure). Encrypted values are
+            stored Base64-encoded (see :meth:`EncryptedValue.to_json`);
+            nothing is decrypted.
+        """
+        def dump(kind: FieldKind, values: list) -> list[str]:
+            if kind is FieldKind.ENCRYPTED:
+                return [v.to_json() for v in values]
+            return list(values)
+
+        return {
+            "metadata": {
+                "uuid": self._uuid,
+                "name": self._name,
+                "creation_date": self._creation_date,
+                "modification_date": self._modification_date,
+            },
+            "fields": cast(ItemFieldsData, {
+                name: dump(_FIELDS[name], values)
+                for name, values in self._fields.items()
+            }),
+            "customs": [
+                {
+                    "id": custom.id,
+                    "name": custom.name,
+                    "kind": custom.kind.value,
+                    "values": dump(custom.kind, custom.values),
+                }
+                for custom in self._customs
+            ],
+            "gui": {
+                "icon": self._icon,
+                "color": self._color,
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: ItemData) -> Item:
+        """
+        Create an item from its serialized representation.
+
+        Parameters
+        ----------
+        data : ItemData
+            Serialized item, as returned by :meth:`to_dict`. Not
+            modified, and not kept by reference.
+
+
+        Returns
+        -------
+        Item
+            The deserialized item. Its encrypted values are not
+            authenticated yet: that only happens when they are
+            decrypted.
+
+
+        Raises
+        ------
+        TypeError
+            If a section or a value does not have the expected type.
+
+        ValueError
+            If a section contains an unknown key, a required key
+            (``metadata.uuid``, or a custom field's ``id``, ``name`` or
+            ``kind``) is missing, a kind is unknown, a date is not an
+            ISO 8601 date, or an encrypted value is not a key-mode
+            bundle (e.g. data from an older format, which must be
+            migrated instead).
+
+        UUIDError
+            If the item UUID or a custom field id is not a UUID in
+            canonical form, or two custom fields share an id.
+
+        CorruptedBase64Error
+            If an encrypted value is not valid Base64.
+
 
         Notes
         -----
-        The returned dictionary is the actual internal dictionary and is
-        therefore not a copy. Modifying it directly modifies the item.
+        Reading rules, so that the format can evolve:
+
+        - an **unknown** key, in any section, is an error: the data was
+          written by a newer version, and reading it anyway would
+          silently drop that key when saving back;
+        - a **missing** key is read as its default (``None``, an empty
+          list, or now for a date), so that data written by an older
+          version, lacking a key added since, can still be read.
+          ``None`` is also accepted wherever a list is expected.
+
+        Does not update :attr:`modification_date`.
         """
-        return self._data
+        def load_secrets(raw: list[str]) -> list[EncryptedValue]:
+            return [EncryptedValue.from_json(v) for v in raw]
+
+        data = cast(ItemData, _check_keys("item", data, _TOP_KEYS))
+
+        metadata = _check_keys("item metadata", data.get("metadata", {}), _METADATA_KEYS)
+        if "uuid" not in metadata:
+            raise ValueError("item metadata must contain a 'uuid'.")
+        item = cls(metadata["uuid"])
+        item._name = _check_optional_name("name", metadata.get("name"))
+        item._creation_date = _check_date(
+            "creation_date", metadata.get("creation_date"), item._creation_date)
+        item._modification_date = _check_date(
+            "modification_date", metadata.get("modification_date"), item._modification_date)
+
+        fields = _check_keys("item fields", data.get("fields", {}), tuple(_FIELDS))
+        for name, kind in _FIELDS.items():
+            raw = fields.get(name)
+            raw = [] if raw is None else _check_clear_list(name, raw)
+            if kind is FieldKind.ENCRYPTED:
+                item._fields[name] = load_secrets(raw)
+            else:
+                item._fields[name] = raw
+
+        customs = data.get("customs") or []
+        if not isinstance(customs, list):
+            raise TypeError("item customs must be a list.")
+        parsed: list[_CustomField] = []
+        for entry in customs:
+            entry = cast(CustomFieldData, _check_keys("custom field", entry, _CUSTOM_KEYS))
+            for key in ("id", "name", "kind"):
+                if key not in entry:
+                    raise ValueError(f"custom field must contain a {key!r}.")
+            custom_id = _check_uuid(entry["id"])
+            custom_name = _check_name("custom field name", entry["name"])
+            kind = _to_kind(entry["kind"])
+            raw = entry.get("values")
+            raw = [] if raw is None else _check_clear_list(f"custom field {custom_name!r}", raw)
+            values: list[EncryptedValue] | list[str]
+            if kind is FieldKind.ENCRYPTED:
+                values = load_secrets(raw)
+            else:
+                values = raw
+            parsed.append(_CustomField(custom_id, custom_name, kind, values))
+        _check_unique_uuids(c.id for c in parsed)
+        item._customs = parsed
+
+        gui = _check_keys("item gui", data.get("gui", {}), _GUI_KEYS)
+        item._icon = _check_optional_str("icon", gui.get("icon"))
+        item._color = _check_optional_str("color", gui.get("color"))
+
+        return item
 
     def deepcopy(self) -> Item:
         """
         Return a deep copy of this item.
- 
+
         Returns
         -------
         Item
-            A new :class:`Item` instance with the same UUID and an
-            independent copy of the item's data: mutating the copy
-            (including its nested lists and the ``custom`` field
-            dictionary) never affects the original item, and vice
+            A new :class:`Item` with the same UUID, dates and values:
+            mutating the copy never affects the original, and vice
             versa.
- 
+
         Notes
         -----
-        This performs no encryption or decryption: encrypted fields
-        are copied exactly as stored (still Base64-encoded and
-        encrypted), so the copy still requires the same
-        :class:`Credentials` to read them.
- 
-        The copy keeps the same UUID as the original. Callers that
-        need a distinct item (for example when duplicating an item
-        within a vault) are responsible for assigning a fresh UUID
-        to the returned copy, e.g. via
-        :meth:`PasswordManager.create_uuid`.
- 
-        Examples
-        --------
-        >>> item_copy = item.deepcopy()
-        >>> item_copy.set("item_name", "Copy")
-        >>> item.get("item_name") != item_copy.get("item_name")
-        True
+        No encryption or decryption is performed: encrypted values are
+        copied as they are, so the copy still needs the same
+        :class:`DataKey` (and the same UUID, see :meth:`change_uuid`)
+        to read them.
         """
-        return Item(self._uuid, copy.deepcopy(self._data))
+        return Item.from_dict(self.to_dict())
+
+    def __deepcopy__(self, memo: dict) -> Item:
+        """Support :func:`copy.deepcopy` (see :meth:`deepcopy`)."""
+        return self.deepcopy()
+
+    def __repr__(self) -> str:
+        """
+        Return a debug-friendly representation of the item.
+
+        Returns
+        -------
+        str
+            A representation built only from the item's UUID, never
+            from any field value, so it stays safe to print or log.
+        """
+        return f"{type(self).__name__}(uuid={self._uuid!r})"

@@ -16,4 +16,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from .credentials_wizard import CredentialsWizard
+from .crash import install_excepthook
+from .window import PasswordManagerWindow
+
+__all__ = ["PasswordManagerWindow", "install_excepthook"]
